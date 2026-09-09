@@ -2,7 +2,16 @@
 
 ## Status
 
-This document describes the intended architecture. The repository implements only the first backend slice with a FastAPI service, deterministic routing, and development-only mock inference; it contains no real inference runtime.
+This document describes both the intended architecture and the currently implemented backend boundaries. The repository contains a FastAPI service, deterministic routing, development-only mock inference, and basic text-generation protocol adapters for local OpenAI-compatible endpoints and vLLM. It contains no installed real inference runtime and no downloaded or served real model.
+
+## Current provider implementation
+
+- `MockProvider` implements deterministic, network-free development inference.
+- `LocalOpenAICompatibleProvider` implements basic text generation against an explicitly configured local OpenAI-compatible endpoint.
+- `VLLMProvider` implements the same basic protocol integration while preserving vLLM-specific provider identity and configuration.
+- Both local HTTP adapters reuse a shared internal OpenAI-compatible transport for request/response handling and local-endpoint safeguards.
+- The adapter milestone does not install a vLLM server, download a model, or serve a real model. Those runtime and model deployment steps remain future work.
+- The implemented adapters do not provide tool calling, vision, embeddings, streaming to clients, structured output, or model management.
 
 ## Architectural drivers
 
@@ -67,7 +76,7 @@ Model providers and inference runtimes are replaceable infrastructure. vLLM, lla
 - **REUSE:** Qdrant as the initial locally operated vector store and mature local artifact serialization libraries, always behind project-owned interfaces where they meet application boundaries.
 - **EVALUATE LATER:** additional inference runtimes, tool-protocol compatibility, gVisor, OPA, and Keycloak. These are not committed dependencies.
 
-These choices do not add any component to the current repository or make it part of the first implementation slice.
+The implemented provider adapters establish the project-owned WRAP boundary for local OpenAI-compatible protocols, including a dedicated vLLM adapter. This code-level integration does not adopt or install the vLLM runtime itself, does not download or serve a model, and does not change ADR 0001's component decisions. The other runtime and component choices above remain future work unless separately documented as implemented.
 
 ## Model registry
 

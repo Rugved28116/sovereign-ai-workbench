@@ -10,7 +10,7 @@ This roadmap is directional. Each phase should remain small, tested, documented,
 - **Docling — reuse where suitable through WRAP:** document conversion runs in a constrained worker behind the project-owned document-processing boundary.
 - **Qdrant — REUSE:** initial locally operated vector store behind a vector-store interface.
 
-These technologies require later dependency, offline, security, and compatibility review before adoption. None is a dependency or implementation target of the first implementation slice. gVisor, OPA, and Keycloak remain **EVALUATE LATER**, not committed dependencies.
+These technologies require dependency, offline, security, and compatibility review before runtime adoption. The basic vLLM provider adapter and its OpenAI-compatible protocol integration are implemented without adding vLLM as a dependency. Installing the vLLM runtime and downloading or serving a real model remain future deployment work. The other listed technologies are not dependencies of the current implementation. gVisor, OPA, and Keycloak remain **EVALUATE LATER**, not committed dependencies.
 
 ## Phase 0: Foundation — complete
 
@@ -21,20 +21,21 @@ These technologies require later dependency, offline, security, and compatibilit
 
 Exit criterion: the foundation is documented, syntactically valid, and contains no application dependencies or secrets.
 
-## Phase 1: First implementation slice — current
+## Phase 1: Backend foundation and provider adapters — current
 
-- Implement only this path:
+- The initial mock path is complete:
 
   ```text
   Browser -> FastAPI -> Model Router -> Mock Provider -> Mock Models
   ```
 
-- Define the minimum provider-neutral contracts needed by the mock path without deciding the exact future provider contract.
-- Load and validate the model registry; enforce exact environment eligibility and reject absent, unknown, or unauthorized environments.
-- Implement Stage 1 sovereign eligibility before Stage 2 deterministic ordering by ascending numeric priority and lexicographic model ID.
-- Add the health endpoint, deterministic mock inference, and negative tests for disabled, incapable, non-development, missing-environment, and unknown-environment models.
+- The provider adapter/protocol milestone is complete: `MockProvider`, `LocalOpenAICompatibleProvider`, and `VLLMProvider` implement the provider-neutral contract, and the two local HTTP adapters reuse a shared OpenAI-compatible transport.
+- The local HTTP adapters currently implement basic text generation only. They do not provide tool calling, vision, embeddings, client streaming, structured output, or model management.
+- Model registry loading and validation, exact environment eligibility, fail-closed environment handling, Stage 1 sovereign eligibility, and Stage 2 deterministic ordering are implemented.
+- The health endpoint, deterministic mock inference, and negative tests for disabled, incapable, non-development, missing-environment, and unknown-environment models are implemented.
+- No real inference runtime or model is included: vLLM is not installed, and no real model has been downloaded or served.
 
-Exit criterion: the exact Browser → FastAPI → Model Router → Mock Provider → Mock Models slice works entirely offline, provider-specific concepts do not enter business contracts, and mock models remain `development`-only.
+Current result: the backend supports the offline mock path plus basic protocol adapters for local OpenAI-compatible and vLLM endpoints. Provider-specific concepts do not enter business contracts, mock models remain `development`-only, and no runtime or model deployment is claimed.
 
 ## Phase 2: Contracts and threat model
 
@@ -47,10 +48,10 @@ Exit criterion: future adapter and security boundaries have explicit contracts a
 
 ## Phase 3: Local inference and routing
 
-- Add approved adapters for locally operated inference runtimes.
+- Deploy approved locally operated inference runtimes behind project-owned provider adapters; add further adapters only where needed.
 - Preserve Stage 1 sovereign eligibility as authoritative, then perform Stage 2 advisory optimization only within its eligible candidate set.
-- Evaluate and, if approved, add vLLM as the primary GPU runtime and llama.cpp for lightweight or constrained inference, each behind its own provider adapter.
-- Support distinct reasoning, coding, vision, embedding, and reranking models.
+- Evaluate and, if approved, install vLLM as the primary GPU runtime and download and serve an approved local model behind the already implemented `VLLMProvider`; separately evaluate llama.cpp for lightweight or constrained inference behind its own provider adapter.
+- Evaluate and implement any later capability-specific support, including reasoning, coding, vision, embedding, and reranking models, through explicit provider-neutral contracts. None of those capability-specific integrations is part of the completed adapter milestone.
 - Test provider failures, fallback policy, cancellation, and resource limits.
 
 Exit criterion: business logic remains unchanged when local providers or model assignments change.
