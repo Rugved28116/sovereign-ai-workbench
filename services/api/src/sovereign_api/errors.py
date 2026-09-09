@@ -29,3 +29,27 @@ class UnsupportedProviderError(SovereignAPIError):
     """Raised when a routed model has no configured provider adapter."""
 
     code = "unsupported_provider"
+
+
+class ProviderError(SovereignAPIError):
+    """Base class for provider adapter failures."""
+
+    code = "provider_error"
+
+
+class ProviderConfigurationError(ProviderError):
+    """Raised when provider-private configuration is missing or invalid."""
+
+    code = "provider_configuration_error"
+
+
+class ProviderConnectionError(ProviderError):
+    """Raised when a configured local provider endpoint cannot be reached."""
+
+    code = "provider_connection_error"
+
+
+class ProviderResponseError(ProviderError):
+    """Raised when a local provider returns an unsuccessful or invalid response."""
+
+    code = "provider_response_error"

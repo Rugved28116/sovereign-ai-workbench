@@ -28,6 +28,18 @@ uv run pytest
 
 `POST /v1/generate` accepts prompts up to 32,768 characters, 1–16 unique required capabilities, and capability names up to 64 characters. Empty prompts, empty capability names, and duplicate capabilities are rejected. The endpoint also has a 256 KiB request-body limit.
 
+### Local OpenAI-compatible provider
+
+Registry entries may use the provider key `local-openai-compatible`. When an enabled entry is eligible for the active environment, provider-private configuration must set:
+
+```bash
+SOVEREIGN_LOCAL_OPENAI_BASE_URL=http://127.0.0.1:8000/v1
+```
+
+The URL may use HTTP or HTTPS with exact `localhost`, IPv4 loopback, RFC1918 private IPv4, or IPv6 loopback. Exact `localhost` is converted to `127.0.0.1` before requests, so accepted endpoints never depend on DNS or hosts-file resolution. Public IP addresses, other DNS hostnames, control characters, and malformed URLs are rejected during configuration. Configuration is not stored in `models/registry.yaml`, redirects are not followed, and environment proxy settings are ignored.
+
+Provider responses are streamed and limited to 4 MiB, including unsuccessful responses. Oversized declared or streamed bodies fail with a typed provider response error. No local runtime or model is installed by this provider adapter.
+
 ## Current limitations
 
-Only deterministic routing and the offline mock provider are implemented. The supplied mock models are `development`-only, so generation fails closed in `on-prem` and `air-gapped`. Authentication, real inference runtimes, orchestration, retrieval, tools, and other later architecture are out of scope.
+Only deterministic routing, the offline mock provider, and the generic local HTTP adapter are implemented. The supplied mock models are `development`-only, so generation fails closed in `on-prem` and `air-gapped`. No real inference runtime or model is included. Authentication, orchestration, retrieval, tools, and other later architecture are out of scope.

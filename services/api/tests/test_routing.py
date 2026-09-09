@@ -55,3 +55,17 @@ def test_misconfigured_mock_model_never_reaches_selection(
 
     with pytest.raises(NoEligibleModelError):
         router.route(frozenset({"chat"}))
+
+
+def test_provider_identity_does_not_change_deterministic_ordering() -> None:
+    router = build_router(
+        model_data("model-z", provider="mock", priority=10),
+        model_data(
+            "model-a", provider="local-openai-compatible", priority=10
+        ),
+    )
+
+    decision = router.route(frozenset({"chat"}))
+
+    assert decision.model.id == "model-a"
+    assert decision.model.provider == "local-openai-compatible"

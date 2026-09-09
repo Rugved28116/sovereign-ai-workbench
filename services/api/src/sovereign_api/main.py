@@ -22,9 +22,18 @@ from sovereign_api.api_models import (
 from sovereign_api.body_limit import GenerateBodyLimitMiddleware
 from sovereign_api.config import DeploymentEnvironment, load_settings
 from sovereign_api.contracts import ModelRequest
-from sovereign_api.errors import NoEligibleModelError, UnsupportedProviderError
-from sovereign_api.providers import MockProvider, ModelProvider
-from sovereign_api.registry import load_registry
+from sovereign_api.errors import (
+    NoEligibleModelError,
+    ProviderError,
+    UnsupportedProviderError,
+)
+from sovereign_api.providers import (
+    LocalOpenAICompatibleProvider,
+    MockProvider,
+    ModelProvider,
+)
+from sovereign_api.providers.local_openai_compatible import PROVIDER_KEY
+from sovereign_api.registry import ModelRegistry, load_registry
 from sovereign_api.routing import DeterministicModelRouter
 
 
@@ -35,6 +44,24 @@ class Runtime:
     providers: Mapping[str, ModelProvider]
 
 
+def configure_providers(
+    registry: ModelRegistry, environment: DeploymentEnvironment
+) -> dict[str, ModelProvider]:
+    providers: dict[str, ModelProvider] = {}
+    if environment is DeploymentEnvironment.DEVELOPMENT:
+        providers["mock"] = MockProvider()
+
+    local_provider_is_enabled = any(
+        model.enabled
+        and environment in model.environments
+        and model.provider == PROVIDER_KEY
+        for model in registry.models
+    )
+    if local_provider_is_enabled:
+        providers[PROVIDER_KEY] = LocalOpenAICompatibleProvider.from_environment()
+    return providers
+
+
 def create_app(*, registry_path: Path | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -43,11 +70,7 @@ def create_app(*, registry_path: Path | None = None) -> FastAPI:
         application.state.runtime = Runtime(
             environment=settings.environment,
             router=DeterministicModelRouter(registry, settings.environment),
-            providers=(
-                {"mock": MockProvider()}
-                if settings.environment is DeploymentEnvironment.DEVELOPMENT
-                else {}
-            ),
+            providers=configure_providers(registry, settings.environment),
         )
         yield
 
@@ -86,6 +109,15 @@ def create_app(*, registry_path: Path | None = None) -> FastAPI:
             content={"error": {"code": error.code, "message": str(error)}},
         )
 
+    @application.exception_handler(ProviderError)
+    async def provider_error_handler(
+        _request: Request, error: ProviderError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"code": error.code, "message": str(error)}},
+        )
+
     @application.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
         return HealthResponse(status="healthy", service="sovereign-api")
@@ -97,6 +129,7 @@ def create_app(*, registry_path: Path | None = None) -> FastAPI:
             413: {"model": ErrorResponse},
             422: {"model": ErrorResponse},
             500: {"model": ErrorResponse},
+            502: {"model": ErrorResponse},
         },
     )
     async def generate(request: GenerateRequest) -> GenerateResponse:
