@@ -1,0 +1,46 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# Dependencies and virtual environments
+node_modules/
+.venv/
+venv/
+
+# Build and test output
+dist/
+build/
+coverage/
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+
+# Framework and tooling caches
+.next/
+.turbo/
+.cache/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+
+# Local model artifacts
+models/artifacts/
+*.gguf
+*.safetensors

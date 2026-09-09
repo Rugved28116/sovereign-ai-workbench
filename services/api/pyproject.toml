@@ -1,0 +1,25 @@
+[project]
+name = "sovereign-api"
+version = "0.1.0"
+description = "Local, provider-neutral API for Sovereign AI Workbench"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.116,<1",
+    "pydantic>=2.11,<3",
+    "pyyaml>=6,<7",
+    "uvicorn>=0.35,<1",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28,<1",
+    "pytest>=8.4,<9",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
