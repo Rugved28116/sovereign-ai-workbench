@@ -1,4 +1,4 @@
-"""Adapter for sovereign local servers exposing an OpenAI-compatible API."""
+"""Provider adapter for a sovereign vLLM OpenAI-compatible endpoint."""
 
 from __future__ import annotations
 
@@ -10,21 +10,20 @@ import httpx
 from sovereign_api.contracts import ModelRequest, ModelResponse
 from sovereign_api.errors import ProviderConfigurationError
 from sovereign_api.providers._openai_compatible import (
-    MAX_RESPONSE_BYTES,
     OpenAICompatibleTransport,
     validate_sovereign_base_url,
 )
 
-PROVIDER_KEY = "local-openai-compatible"
-BASE_URL_ENVIRONMENT_VARIABLE = "SOVEREIGN_LOCAL_OPENAI_BASE_URL"
+PROVIDER_KEY = "vllm"
+BASE_URL_ENVIRONMENT_VARIABLE = "SOVEREIGN_VLLM_BASE_URL"
 
 
 @dataclass(frozen=True, slots=True)
-class LocalOpenAICompatibleConfig:
+class VLLMConfig:
     base_url: str
 
     @classmethod
-    def from_environment(cls) -> "LocalOpenAICompatibleConfig":
+    def from_environment(cls) -> "VLLMConfig":
         raw_base_url = os.environ.get(BASE_URL_ENVIRONMENT_VARIABLE)
         if raw_base_url is None:
             raise ProviderConfigurationError(
@@ -33,8 +32,8 @@ class LocalOpenAICompatibleConfig:
         return cls(base_url=validate_sovereign_base_url(raw_base_url))
 
 
-class LocalOpenAICompatibleProvider:
-    """Backward-compatible generic adapter for local compatible servers."""
+class VLLMProvider:
+    """Basic text-generation adapter for a separately operated vLLM server."""
 
     provider_key = PROVIDER_KEY
 
@@ -49,8 +48,8 @@ class LocalOpenAICompatibleProvider:
         )
 
     @classmethod
-    def from_environment(cls) -> "LocalOpenAICompatibleProvider":
-        config = LocalOpenAICompatibleConfig.from_environment()
+    def from_environment(cls) -> "VLLMProvider":
+        config = VLLMConfig.from_environment()
         return cls(config.base_url)
 
     async def generate(self, request: ModelRequest) -> ModelResponse:

@@ -31,8 +31,12 @@ from sovereign_api.providers import (
     LocalOpenAICompatibleProvider,
     MockProvider,
     ModelProvider,
+    VLLMProvider,
 )
-from sovereign_api.providers.local_openai_compatible import PROVIDER_KEY
+from sovereign_api.providers.local_openai_compatible import (
+    PROVIDER_KEY as LOCAL_OPENAI_COMPATIBLE_PROVIDER_KEY,
+)
+from sovereign_api.providers.vllm import PROVIDER_KEY as VLLM_PROVIDER_KEY
 from sovereign_api.registry import ModelRegistry, load_registry
 from sovereign_api.routing import DeterministicModelRouter
 
@@ -51,15 +55,28 @@ def configure_providers(
     if environment is DeploymentEnvironment.DEVELOPMENT:
         providers["mock"] = MockProvider()
 
-    local_provider_is_enabled = any(
+    if _provider_is_enabled(
+        registry, environment, LOCAL_OPENAI_COMPATIBLE_PROVIDER_KEY
+    ):
+        providers[LOCAL_OPENAI_COMPATIBLE_PROVIDER_KEY] = (
+            LocalOpenAICompatibleProvider.from_environment()
+        )
+    if _provider_is_enabled(registry, environment, VLLM_PROVIDER_KEY):
+        providers[VLLM_PROVIDER_KEY] = VLLMProvider.from_environment()
+    return providers
+
+
+def _provider_is_enabled(
+    registry: ModelRegistry,
+    environment: DeploymentEnvironment,
+    provider_key: str,
+) -> bool:
+    return any(
         model.enabled
         and environment in model.environments
-        and model.provider == PROVIDER_KEY
+        and model.provider == provider_key
         for model in registry.models
     )
-    if local_provider_is_enabled:
-        providers[PROVIDER_KEY] = LocalOpenAICompatibleProvider.from_environment()
-    return providers
 
 
 def create_app(*, registry_path: Path | None = None) -> FastAPI:

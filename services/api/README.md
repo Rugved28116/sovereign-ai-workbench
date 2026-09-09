@@ -40,6 +40,18 @@ The URL may use HTTP or HTTPS with exact `localhost`, IPv4 loopback, RFC1918 pri
 
 Provider responses are streamed and limited to 4 MiB, including unsuccessful responses. Oversized declared or streamed bodies fail with a typed provider response error. No local runtime or model is installed by this provider adapter.
 
+The generic `local-openai-compatible` provider remains supported for backward compatibility with local compatible servers.
+
+### vLLM provider
+
+Registry entries may use the runtime-specific provider key `vllm`. When an enabled vLLM entry is eligible for the active environment, set its provider-private endpoint configuration with:
+
+```bash
+SOVEREIGN_VLLM_BASE_URL=http://127.0.0.1:8000/v1
+```
+
+The vLLM adapter reuses the same sovereign endpoint validation, DNS avoidance, proxy and redirect controls, and 4 MiB streamed response limit described above. This milestone implements only the basic text-generation protocol adapter; it does not install a vLLM server or model, and it does not support client streaming, tools, vision, embeddings, or model management.
+
 ## Current limitations
 
-Only deterministic routing, the offline mock provider, and the generic local HTTP adapter are implemented. The supplied mock models are `development`-only, so generation fails closed in `on-prem` and `air-gapped`. No real inference runtime or model is included. Authentication, orchestration, retrieval, tools, and other later architecture are out of scope.
+Only deterministic routing, the offline mock provider, and local HTTP protocol adapters are implemented. The supplied mock models are `development`-only, so generation fails closed in `on-prem` and `air-gapped`. No real inference runtime or model is included. Authentication, orchestration, retrieval, tools, and other later architecture are out of scope.
