@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import unicodedata
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
@@ -45,9 +46,13 @@ class LocalOpenAICompatibleConfig:
 
 
 def validate_sovereign_base_url(value: str) -> str:
-    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+    if value != value.strip():
         raise ProviderConfigurationError(
-            "Local provider base URL must not contain ASCII control characters"
+            "Local provider base URL must not contain surrounding whitespace"
+        )
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise ProviderConfigurationError(
+            "Local provider base URL must not contain Unicode control characters"
         )
     _reject_malformed_percent_encoding(value)
 
