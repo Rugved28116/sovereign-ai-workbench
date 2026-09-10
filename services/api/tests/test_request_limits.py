@@ -43,6 +43,12 @@ def test_request_field_limits_accept_exact_boundaries() -> None:
     )
 
 
+def test_required_capabilities_may_be_omitted_for_classification() -> None:
+    request = GenerateRequest.model_validate({"prompt": "Hello"})
+
+    assert request.required_capabilities is None
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -58,6 +64,7 @@ def test_request_field_limits_accept_exact_boundaries() -> None:
             ]
         ),
         valid_request(required_capabilities=["chat", "chat"]),
+        valid_request(required_capabilities=None),
     ],
 )
 def test_invalid_request_field_boundary_is_rejected(payload: dict[str, Any]) -> None:

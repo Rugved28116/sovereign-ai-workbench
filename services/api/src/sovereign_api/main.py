@@ -40,6 +40,12 @@ from sovereign_api.providers.local_openai_compatible import (
 from sovereign_api.providers.vllm import PROVIDER_KEY as VLLM_PROVIDER_KEY
 from sovereign_api.registry import ModelRegistry, load_registry
 from sovereign_api.routing import DeterministicModelRouter
+from sovereign_api.task_classification import (
+    DeterministicTaskClassifier,
+    TaskClass,
+    TaskClassifier,
+    required_capabilities_for,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +53,7 @@ class Runtime:
     environment: DeploymentEnvironment
     router: DeterministicModelRouter
     providers: Mapping[str, ModelProvider]
+    task_classifier: TaskClassifier
 
 
 def configure_providers(
@@ -80,7 +87,17 @@ def _provider_is_enabled(
     )
 
 
-def create_app(*, registry_path: Path | None = None) -> FastAPI:
+def create_app(
+    *,
+    registry_path: Path | None = None,
+    task_classifier: TaskClassifier | None = None,
+) -> FastAPI:
+    configured_task_classifier = (
+        task_classifier
+        if task_classifier is not None
+        else DeterministicTaskClassifier()
+    )
+
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         settings = load_settings(registry_path=registry_path)
@@ -89,6 +106,7 @@ def create_app(*, registry_path: Path | None = None) -> FastAPI:
             environment=settings.environment,
             router=DeterministicModelRouter(registry, settings.environment),
             providers=configure_providers(registry, settings.environment),
+            task_classifier=configured_task_classifier,
         )
         yield
 
@@ -152,6 +170,7 @@ def create_app(*, registry_path: Path | None = None) -> FastAPI:
     @application.post(
         "/v1/generate",
         response_model=GenerateResponse,
+        response_model_exclude_none=True,
         responses={
             413: {"model": ErrorResponse},
             422: {"model": ErrorResponse},
@@ -161,7 +180,16 @@ def create_app(*, registry_path: Path | None = None) -> FastAPI:
     )
     async def generate(request: GenerateRequest) -> GenerateResponse:
         runtime: Runtime = application.state.runtime
-        decision = runtime.router.route(frozenset(request.required_capabilities))
+        task_class: TaskClass | None = None
+        if request.required_capabilities is None:
+            task_class = runtime.task_classifier.classify(request.prompt)
+            required_capabilities = list(required_capabilities_for(task_class))
+            capability_source = "inferred"
+        else:
+            required_capabilities = request.required_capabilities
+            capability_source = "explicit"
+
+        decision = runtime.router.route(frozenset(required_capabilities))
         provider = runtime.providers.get(decision.model.provider)
         if provider is None:
             raise UnsupportedProviderError(
@@ -177,7 +205,17 @@ def create_app(*, registry_path: Path | None = None) -> FastAPI:
             content=result.content,
             routing=RoutingInformation(
                 environment=runtime.environment,
-                required_capabilities=request.required_capabilities,
+                required_capabilities=required_capabilities,
+                capability_source=(
+                    capability_source
+                    if runtime.environment is DeploymentEnvironment.DEVELOPMENT
+                    else None
+                ),
+                task_class=(
+                    task_class
+                    if runtime.environment is DeploymentEnvironment.DEVELOPMENT
+                    else None
+                ),
             ),
         )
 

@@ -26,7 +26,13 @@ uv run pytest
 
 `SOVEREIGN_ENV` is mandatory and accepts exactly `development`, `on-prem`, or `air-gapped`. Missing or unknown values fail application startup.
 
-`POST /v1/generate` accepts prompts up to 32,768 characters, 1–16 unique required capabilities, and capability names up to 64 characters. Empty prompts, empty capability names, and duplicate capabilities are rejected. The endpoint also has a 256 KiB request-body limit.
+`POST /v1/generate` accepts prompts up to 32,768 characters. Callers may explicitly supply 1–16 unique `required_capabilities`, with capability names up to 64 characters; explicit capabilities bypass automatic classification. When the field is omitted, a deterministic classifier infers one required capability. Empty prompts, explicit `null`, empty capability lists or names, and duplicate capabilities are rejected. The endpoint also has a 256 KiB request-body limit.
+
+## Deterministic task classification
+
+Automatic classification is provider-neutral and uses normalized prompt text with first-match precedence: `vision` → `coding` → `document` → `reasoning` → `general`. The classes map respectively to `vision`, `coding`, `document`, `reasoning`, and `chat` capabilities. Ambiguous requests default to `general`/`chat`; classification never selects a model or provider and cannot bypass Stage 1 eligibility or environment restrictions.
+
+The classifier is currently a conservative keyword-and-phrase ruleset. It performs no model calls, embeddings, semantic routing, network access, or learned scoring. In `development`, response routing metadata identifies whether capabilities were `explicit` or `inferred` and includes the inferred task class. These classifier details are omitted from successful responses in other environments.
 
 ## Two-stage routing
 
