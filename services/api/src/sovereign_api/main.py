@@ -23,6 +23,7 @@ from sovereign_api.body_limit import GenerateBodyLimitMiddleware
 from sovereign_api.config import DeploymentEnvironment, load_settings
 from sovereign_api.contracts import ModelRequest
 from sovereign_api.errors import (
+    InvalidOptimizerSelectionError,
     NoEligibleModelError,
     ProviderError,
     UnsupportedProviderError,
@@ -114,6 +115,15 @@ def create_app(*, registry_path: Path | None = None) -> FastAPI:
     ) -> JSONResponse:
         return JSONResponse(
             status_code=422,
+            content={"error": {"code": error.code, "message": str(error)}},
+        )
+
+    @application.exception_handler(InvalidOptimizerSelectionError)
+    async def invalid_optimizer_selection_handler(
+        _request: Request, error: InvalidOptimizerSelectionError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=500,
             content={"error": {"code": error.code, "message": str(error)}},
         )
 

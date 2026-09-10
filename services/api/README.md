@@ -28,6 +28,12 @@ uv run pytest
 
 `POST /v1/generate` accepts prompts up to 32,768 characters, 1–16 unique required capabilities, and capability names up to 64 characters. Empty prompts, empty capability names, and duplicate capabilities are rejected. The endpoint also has a 256 KiB request-body limit.
 
+## Two-stage routing
+
+Routing first applies the mandatory, fail-closed sovereign eligibility filter. Only models approved for enablement, the exact active environment, mock-provider restrictions, and all requested capabilities reach the Stage 2 optimizer.
+
+Stage 2 uses a provider-neutral optimizer interface over immutable candidate projections; registry models and provider configuration are not exposed to it. Its current deterministic implementation selects by ascending numeric priority and then ascending lexicographic model ID, preserving existing behavior. Optimizer output is checked against a private snapshot of the exact Stage 1-approved state; returning an unknown, rejected, or altered candidate raises a typed routing error instead of falling back or bypassing eligibility. No learned classification, semantic routing, telemetry, scoring, or load balancing is implemented.
+
 ### Local OpenAI-compatible provider
 
 Registry entries may use the provider key `local-openai-compatible`. When an enabled entry is eligible for the active environment, provider-private configuration must set:

@@ -19,10 +19,22 @@ class RegistryValidationError(SovereignAPIError):
     code = "invalid_registry"
 
 
-class NoEligibleModelError(SovereignAPIError):
+class RoutingError(SovereignAPIError):
+    """Base class for failures at the two-stage routing boundary."""
+
+    code = "routing_error"
+
+
+class NoEligibleModelError(RoutingError):
     """Raised when Stage 1 rejects every registered model."""
 
     code = "no_eligible_model"
+
+
+class InvalidOptimizerSelectionError(RoutingError):
+    """Raised when Stage 2 returns a model outside the Stage 1 candidate set."""
+
+    code = "invalid_optimizer_selection"
 
 
 class UnsupportedProviderError(SovereignAPIError):
