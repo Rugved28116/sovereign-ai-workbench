@@ -2,6 +2,7 @@
 
 import re
 import unicodedata
+from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Final, Mapping, Protocol
@@ -13,6 +14,19 @@ class TaskClass(StrEnum):
     REASONING = "reasoning"
     DOCUMENT = "document"
     VISION = "vision"
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRequirements:
+    """Immutable provider-neutral requirements inferred for one task."""
+
+    task_class: TaskClass
+    required_capabilities: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "required_capabilities", tuple(self.required_capabilities)
+        )
 
 
 TASK_CLASS_CAPABILITIES: Final[Mapping[TaskClass, tuple[str, ...]]] = MappingProxyType(
@@ -29,8 +43,8 @@ TASK_CLASS_CAPABILITIES: Final[Mapping[TaskClass, tuple[str, ...]]] = MappingPro
 class TaskClassifier(Protocol):
     """Infer a provider-neutral task class from validated request text."""
 
-    def classify(self, prompt: str) -> TaskClass:
-        """Return one supported task class without selecting a model or provider."""
+    def classify(self, prompt: str) -> TaskRequirements:
+        """Return requirements without selecting a model or provider."""
         ...
 
 
@@ -43,10 +57,52 @@ class DeterministicTaskClassifier:
         TaskClass.DOCUMENT,
         TaskClass.REASONING,
     )
+    _COMBINATION_RULES: Final[
+        tuple[tuple[frozenset[TaskClass], tuple[str, ...]], ...]
+    ] = (
+        (
+            frozenset(
+                {TaskClass.DOCUMENT, TaskClass.VISION, TaskClass.REASONING}
+            ),
+            ("document", "vision", "reasoning"),
+        ),
+        (
+            frozenset({TaskClass.VISION, TaskClass.CODING}),
+            ("vision", "coding"),
+        ),
+        (
+            frozenset({TaskClass.DOCUMENT, TaskClass.CODING}),
+            ("document", "coding"),
+        ),
+        (
+            frozenset({TaskClass.VISION, TaskClass.REASONING}),
+            ("vision", "reasoning"),
+        ),
+        (
+            frozenset({TaskClass.DOCUMENT, TaskClass.REASONING}),
+            ("document", "reasoning"),
+        ),
+        (
+            frozenset({TaskClass.DOCUMENT, TaskClass.VISION}),
+            ("document", "vision"),
+        ),
+        (
+            frozenset({TaskClass.CODING, TaskClass.REASONING}),
+            ("coding", "reasoning"),
+        ),
+    )
     _TOKEN_SIGNALS: Final[Mapping[TaskClass, frozenset[str]]] = MappingProxyType(
         {
             TaskClass.VISION: frozenset(
-                {"image", "photograph", "drawing", "diagram", "screenshot", "scan"}
+                {
+                    "image",
+                    "photograph",
+                    "drawing",
+                    "diagram",
+                    "screenshot",
+                    "scan",
+                    "scanned",
+                }
             ),
             TaskClass.CODING: frozenset(
                 {
@@ -67,7 +123,7 @@ class DeterministicTaskClassifier:
                 {"document", "report", "pdf", "summarize", "extract"}
             ),
             TaskClass.REASONING: frozenset(
-                {"calculate", "analyze", "compare", "reason", "derive"}
+                {"calculate", "analyze", "compare", "reason", "derive", "explain"}
             ),
         }
     )
@@ -81,7 +137,7 @@ class DeterministicTaskClassifier:
         }
     )
 
-    def classify(self, prompt: str) -> TaskClass:
+    def classify(self, prompt: str) -> TaskRequirements:
         normalized = " ".join(
             unicodedata.normalize("NFKC", prompt).casefold().split()
         )
@@ -94,18 +150,34 @@ class DeterministicTaskClassifier:
         )
         normalized_tokens = f" {' '.join(token_sequence)} "
 
-        for task_class in self._PRECEDENCE:
-            if tokens & self._TOKEN_SIGNALS.get(task_class, frozenset()):
-                return task_class
-            if any(
+        detected_classes = frozenset(
+            task_class
+            for task_class in self._PRECEDENCE
+            if tokens & self._TOKEN_SIGNALS.get(task_class, frozenset())
+            or any(
                 f" {phrase} " in normalized_tokens
                 for phrase in self._PHRASE_SIGNALS.get(task_class, ())
-            ):
-                return task_class
+            )
+        )
+        if not detected_classes:
+            return TaskRequirements(
+                task_class=TaskClass.GENERAL,
+                required_capabilities=TASK_CLASS_CAPABILITIES[TaskClass.GENERAL],
+            )
 
-        return TaskClass.GENERAL
+        task_class = next(
+            candidate
+            for candidate in self._PRECEDENCE
+            if candidate in detected_classes
+        )
+        for required_classes, required_capabilities in self._COMBINATION_RULES:
+            if required_classes.issubset(detected_classes):
+                return TaskRequirements(
+                    task_class=task_class,
+                    required_capabilities=required_capabilities,
+                )
 
-
-def required_capabilities_for(task_class: TaskClass) -> tuple[str, ...]:
-    """Map a supported task class to its provider-neutral capability requirement."""
-    return TASK_CLASS_CAPABILITIES[task_class]
+        return TaskRequirements(
+            task_class=task_class,
+            required_capabilities=TASK_CLASS_CAPABILITIES[task_class],
+        )

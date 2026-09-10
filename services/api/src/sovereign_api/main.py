@@ -44,7 +44,6 @@ from sovereign_api.task_classification import (
     DeterministicTaskClassifier,
     TaskClass,
     TaskClassifier,
-    required_capabilities_for,
 )
 
 
@@ -182,8 +181,9 @@ def create_app(
         runtime: Runtime = application.state.runtime
         task_class: TaskClass | None = None
         if request.required_capabilities is None:
-            task_class = runtime.task_classifier.classify(request.prompt)
-            required_capabilities = list(required_capabilities_for(task_class))
+            task_requirements = runtime.task_classifier.classify(request.prompt)
+            task_class = task_requirements.task_class
+            required_capabilities = list(task_requirements.required_capabilities)
             capability_source = "inferred"
         else:
             required_capabilities = request.required_capabilities

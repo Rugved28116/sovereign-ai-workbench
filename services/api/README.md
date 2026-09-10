@@ -26,13 +26,15 @@ uv run pytest
 
 `SOVEREIGN_ENV` is mandatory and accepts exactly `development`, `on-prem`, or `air-gapped`. Missing or unknown values fail application startup.
 
-`POST /v1/generate` accepts prompts up to 32,768 characters. Callers may explicitly supply 1–16 unique `required_capabilities`, with capability names up to 64 characters; explicit capabilities bypass automatic classification. When the field is omitted, a deterministic classifier infers one required capability. Empty prompts, explicit `null`, empty capability lists or names, and duplicate capabilities are rejected. The endpoint also has a 256 KiB request-body limit.
+`POST /v1/generate` accepts prompts up to 32,768 characters. Callers may explicitly supply 1–16 unique `required_capabilities`, with capability names up to 64 characters; explicit capabilities bypass automatic classification. When the field is omitted, deterministic classifier rules infer one or more required capabilities. Empty prompts, explicit `null`, empty capability lists or names, and duplicate capabilities are rejected. The endpoint also has a 256 KiB request-body limit.
 
 ## Deterministic task classification
 
-Automatic classification is provider-neutral and uses normalized prompt text with first-match precedence: `vision` → `coding` → `document` → `reasoning` → `general`. The classes map respectively to `vision`, `coding`, `document`, `reasoning`, and `chat` capabilities. Ambiguous requests default to `general`/`chat`; classification never selects a model or provider and cannot bypass Stage 1 eligibility or environment restrictions.
+Automatic classification is provider-neutral and uses normalized prompt text with primary-class precedence: `vision` → `coding` → `document` → `reasoning` → `general`. A frozen task-requirements value can contain one or more capabilities. Explicit combination rules cover document/vision/reasoning, vision/coding, document/coding, vision/reasoning, document/reasoning, document/vision, and coding/reasoning requests; signals are not blindly unioned. Ambiguous requests default to `general`/`chat`; classification never selects a model or provider and cannot bypass Stage 1 eligibility or environment restrictions.
 
-The classifier is currently a conservative keyword-and-phrase ruleset. It performs no model calls, embeddings, semantic routing, network access, or learned scoring. In `development`, response routing metadata identifies whether capabilities were `explicit` or `inferred` and includes the inferred task class. These classifier details are omitted from successful responses in other environments.
+Inferred capabilities use AND semantics and are emitted in deterministic `document`, `vision`, `coding`, `reasoning`, `chat` order as applicable. Stage 1 requires one eligible model to support all of them; capabilities are never dropped, and decomposition across multiple models is not supported. Explicit client capabilities remain authoritative, retain caller order, and bypass inference entirely.
+
+The classifier is currently a conservative keyword-and-phrase ruleset. It performs no model calls, embeddings, semantic routing, network access, or learned scoring. In `development`, response routing metadata identifies whether capabilities were `explicit` or `inferred` and includes the inferred task class and required capabilities. These classifier details are omitted from successful responses in other environments.
 
 ## Two-stage routing
 

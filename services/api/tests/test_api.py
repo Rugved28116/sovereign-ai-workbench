@@ -94,6 +94,61 @@ def test_inferred_unavailable_capability_still_fails_stage_1(
     assert response.json()["error"]["code"] == "no_eligible_model"
 
 
+def test_inferred_multi_capability_requires_all_capabilities_in_stage_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SOVEREIGN_ENV", "development")
+    registry_path = write_registry(
+        tmp_path,
+        registry_data(
+            model_data(
+                "vision-only",
+                capabilities=["vision"],
+                priority=1,
+            ),
+            model_data(
+                "vision-reasoning",
+                capabilities=["vision", "reasoning"],
+                priority=20,
+            ),
+        ),
+    )
+
+    response = request_app(
+        create_app(registry_path=registry_path),
+        "POST",
+        "/v1/generate",
+        json={"prompt": "compare these two diagrams"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model_id"] == "vision-reasoning"
+    assert response.json()["routing"]["required_capabilities"] == [
+        "vision",
+        "reasoning",
+    ]
+
+
+def test_no_eligible_multi_capability_model_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SOVEREIGN_ENV", "development")
+    registry_path = write_registry(
+        tmp_path,
+        registry_data(model_data("vision-only", capabilities=["vision"])),
+    )
+
+    response = request_app(
+        create_app(registry_path=registry_path),
+        "POST",
+        "/v1/generate",
+        json={"prompt": "compare these two diagrams"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "no_eligible_model"
+
+
 def test_on_prem_cannot_route_development_only_mock_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
