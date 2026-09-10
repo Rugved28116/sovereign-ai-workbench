@@ -36,6 +36,12 @@ Inferred capabilities use AND semantics and are emitted in deterministic `docume
 
 The classifier is currently a conservative keyword-and-phrase ruleset. It performs no model calls, embeddings, semantic routing, network access, or learned scoring. In `development`, response routing metadata identifies whether capabilities were `explicit` or `inferred` and includes the inferred task class and required capabilities. These classifier details are omitted from successful responses in other environments.
 
+## Task requirement planning
+
+`TaskRequirements` describe what the current request needs and continue to route through Stage 1 with AND semantics. For inferred requests, the deterministic `TaskRequirementPlanner` also creates an immutable `TaskPlan` describing how those capabilities may later be decomposed into ordered `generate`, `code`, `document`, `vision`, or `reason` stages with deterministic `stage-N` IDs.
+
+Plans are metadata only and are not executed. `/v1/generate` still routes the complete current requirement set to one model; it does not invoke stages, split work across models, or weaken capabilities. Development responses expose inferred plans for inspection, while non-development responses omit them. Any future stage execution must independently re-enter sovereign eligibility and routing before a model is selected. Unsupported or non-canonical capability sequences fail closed rather than being dropped, invented, or reordered.
+
 ## Two-stage routing
 
 Routing first applies the mandatory, fail-closed sovereign eligibility filter. Only models approved for enablement, the exact active environment, mock-provider restrictions, and all requested capabilities reach the Stage 2 optimizer.

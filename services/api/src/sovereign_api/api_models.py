@@ -13,6 +13,7 @@ from pydantic import (
 
 from sovereign_api.config import DeploymentEnvironment
 from sovereign_api.task_classification import TaskClass
+from sovereign_api.task_planning import TaskPlan
 
 MAX_PROMPT_LENGTH = 32_768
 MAX_REQUIRED_CAPABILITIES = 16
@@ -64,6 +65,7 @@ class RoutingInformation(BaseModel):
     required_capabilities: list[str]
     capability_source: Literal["explicit", "inferred"] | None = None
     task_class: TaskClass | None = None
+    plan: TaskPlan | None = None
 
 
 class GenerateResponse(BaseModel):

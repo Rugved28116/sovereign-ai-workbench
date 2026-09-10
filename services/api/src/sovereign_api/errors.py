@@ -37,6 +37,18 @@ class InvalidOptimizerSelectionError(RoutingError):
     code = "invalid_optimizer_selection"
 
 
+class PlanningError(SovereignAPIError):
+    """Base class for deterministic task planning failures."""
+
+    code = "planning_error"
+
+
+class UnsupportedTaskRequirementsError(PlanningError):
+    """Raised when task requirements have no explicit planning rule."""
+
+    code = "unsupported_task_requirements"
+
+
 class UnsupportedProviderError(SovereignAPIError):
     """Raised when a routed model has no configured provider adapter."""
 

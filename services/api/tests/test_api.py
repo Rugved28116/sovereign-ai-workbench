@@ -54,6 +54,16 @@ def test_missing_capabilities_are_inferred_before_routing(
         "required_capabilities": ["coding"],
         "capability_source": "inferred",
         "task_class": "coding",
+        "plan": {
+            "task_class": "coding",
+            "stages": [
+                {
+                    "stage_id": "stage-1",
+                    "stage_type": "code",
+                    "required_capabilities": ["coding"],
+                }
+            ],
+        },
     }
 
 
@@ -64,9 +74,16 @@ def test_explicit_capabilities_bypass_classifier(
         def classify(self, prompt: str) -> None:
             pytest.fail("classifier must not run for explicit capabilities")
 
+    class UnexpectedPlanner:
+        def plan(self, requirements: object) -> None:
+            pytest.fail("planner must not run for explicit capabilities")
+
     monkeypatch.setenv("SOVEREIGN_ENV", "development")
     response = request_app(
-        create_app(task_classifier=UnexpectedClassifier()),
+        create_app(
+            task_classifier=UnexpectedClassifier(),
+            task_planner=UnexpectedPlanner(),
+        ),
         "POST",
         "/v1/generate",
         json={"prompt": "Inspect this image", "required_capabilities": ["coding"]},
@@ -76,6 +93,7 @@ def test_explicit_capabilities_bypass_classifier(
     assert response.json()["model_id"] == "mock-code"
     assert response.json()["routing"]["capability_source"] == "explicit"
     assert "task_class" not in response.json()["routing"]
+    assert "plan" not in response.json()["routing"]
 
 
 def test_inferred_unavailable_capability_still_fails_stage_1(
@@ -127,6 +145,21 @@ def test_inferred_multi_capability_requires_all_capabilities_in_stage_1(
         "vision",
         "reasoning",
     ]
+    assert response.json()["routing"]["plan"] == {
+        "task_class": "vision",
+        "stages": [
+            {
+                "stage_id": "stage-1",
+                "stage_type": "vision",
+                "required_capabilities": ["vision"],
+            },
+            {
+                "stage_id": "stage-2",
+                "stage_type": "reason",
+                "required_capabilities": ["reasoning"],
+            },
+        ],
+    }
 
 
 def test_no_eligible_multi_capability_model_fails_closed(

@@ -25,6 +25,7 @@ from sovereign_api.contracts import ModelRequest
 from sovereign_api.errors import (
     InvalidOptimizerSelectionError,
     NoEligibleModelError,
+    PlanningError,
     ProviderError,
     UnsupportedProviderError,
 )
@@ -45,6 +46,11 @@ from sovereign_api.task_classification import (
     TaskClass,
     TaskClassifier,
 )
+from sovereign_api.task_planning import (
+    DeterministicTaskRequirementPlanner,
+    TaskPlan,
+    TaskRequirementPlanner,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +59,7 @@ class Runtime:
     router: DeterministicModelRouter
     providers: Mapping[str, ModelProvider]
     task_classifier: TaskClassifier
+    task_planner: TaskRequirementPlanner
 
 
 def configure_providers(
@@ -90,11 +97,17 @@ def create_app(
     *,
     registry_path: Path | None = None,
     task_classifier: TaskClassifier | None = None,
+    task_planner: TaskRequirementPlanner | None = None,
 ) -> FastAPI:
     configured_task_classifier = (
         task_classifier
         if task_classifier is not None
         else DeterministicTaskClassifier()
+    )
+    configured_task_planner = (
+        task_planner
+        if task_planner is not None
+        else DeterministicTaskRequirementPlanner()
     )
 
     @asynccontextmanager
@@ -106,6 +119,7 @@ def create_app(
             router=DeterministicModelRouter(registry, settings.environment),
             providers=configure_providers(registry, settings.environment),
             task_classifier=configured_task_classifier,
+            task_planner=configured_task_planner,
         )
         yield
 
@@ -138,6 +152,15 @@ def create_app(
     @application.exception_handler(InvalidOptimizerSelectionError)
     async def invalid_optimizer_selection_handler(
         _request: Request, error: InvalidOptimizerSelectionError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"code": error.code, "message": str(error)}},
+        )
+
+    @application.exception_handler(PlanningError)
+    async def planning_error_handler(
+        _request: Request, error: PlanningError
     ) -> JSONResponse:
         return JSONResponse(
             status_code=500,
@@ -180,9 +203,11 @@ def create_app(
     async def generate(request: GenerateRequest) -> GenerateResponse:
         runtime: Runtime = application.state.runtime
         task_class: TaskClass | None = None
+        task_plan: TaskPlan | None = None
         if request.required_capabilities is None:
             task_requirements = runtime.task_classifier.classify(request.prompt)
             task_class = task_requirements.task_class
+            task_plan = runtime.task_planner.plan(task_requirements)
             required_capabilities = list(task_requirements.required_capabilities)
             capability_source = "inferred"
         else:
@@ -213,6 +238,11 @@ def create_app(
                 ),
                 task_class=(
                     task_class
+                    if runtime.environment is DeploymentEnvironment.DEVELOPMENT
+                    else None
+                ),
+                plan=(
+                    task_plan
                     if runtime.environment is DeploymentEnvironment.DEVELOPMENT
                     else None
                 ),
