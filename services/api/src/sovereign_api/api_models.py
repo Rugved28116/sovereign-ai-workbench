@@ -12,17 +12,13 @@ from pydantic import (
 )
 
 from sovereign_api.config import DeploymentEnvironment
+from sovereign_api.prompt_validation import MAX_PROMPT_LENGTH, Prompt
 from sovereign_api.task_classification import TaskClass
 from sovereign_api.task_planning import TaskPlan
 
-MAX_PROMPT_LENGTH = 32_768
 MAX_REQUIRED_CAPABILITIES = 16
 MAX_CAPABILITY_NAME_LENGTH = 64
 
-Prompt = Annotated[
-    str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_PROMPT_LENGTH),
-]
 CapabilityName = Annotated[
     str,
     StringConstraints(

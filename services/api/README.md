@@ -52,7 +52,13 @@ The domain exposes a compare-and-swap validation contract that rejects an expect
 
 The provider-neutral `SequentialTaskOrchestrator` can now process a `TaskPlan` in order through a pluggable asynchronous `StageExecutor`. It uses only the latest immutable `AgentTask` returned by the execution-state transition API, so each task or step transition advances the task revision without direct field mutation. Known executor failures become failed task snapshots using the existing atomic failure disposition; unexpected exceptions receive a fixed safe error message, and execution stops immediately.
 
-`MockStageExecutor` supplies deterministic, network-free results and optional deterministic failure injection for development and tests only. No public orchestration endpoint, persistence, parallel execution, live cancellation, tool execution, or real model execution is included, and `/v1/generate` remains unchanged.
+`MockStageExecutor` supplies deterministic, network-free results and optional deterministic failure injection for development and tests only. No public orchestration endpoint, persistence, parallel execution, live cancellation, or tool execution is included, and `/v1/generate` remains unchanged.
+
+`ModelStageExecutor` is an explicit alternative that routes every stage independently through the existing Stage 1 sovereign eligibility filter and Stage 2 optimizer, then invokes the approved provider through `ModelProvider`. Composition supplies the configured router, provider mapping, and a frozen `TaskExecutionInput` for each task run. The original prompt uses the same whitespace normalization and 1–32,768 character limits as generation requests.
+
+Stage context contains the original prompt, ordered earlier successful results labelled with stage ID/type, and the current stage type. Current and future results are excluded. The entire composed context is limited to 65,536 characters including labels; overflow fails with a typed stage error before routing, without truncation. This is a character bound, not a tokenizer-specific context-window guarantee. Responses become text `StepResult` values without adding model/provider metadata. Provider content is preserved as returned (including the existing mock provider's synthetic text).
+
+Expected routing failures, unavailable providers, provider exceptions, and malformed responses become a fixed safe `StageExecutionError`; the orchestrator then fails the task and dispositions remaining work. Unexpected router or optimizer defects propagate to the orchestrator's separate, sanitized unexpected-failure path. There are no retries or fallback providers. This executor adds no direct network implementation: future eligible runtime adapters use their existing transport and sovereignty controls. No runtime or model is installed, and the shared registry is unchanged.
 
 ## Two-stage routing
 
