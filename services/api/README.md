@@ -68,6 +68,14 @@ Internal routed-stage provenance is stored in optional immutable `AgentStep.prov
 
 The digest is SHA-256 over UTF-8 JSON containing `content` and `output_type`, with sorted keys, compact separators, and unescaped Unicode. Content strings are preserved exactly, including serialized structured content; this does not normalize semantically equivalent structured strings. Failed executions have no digest. No provenance is fabricated when routing fails before approval, or for skipped stages and `MockStageExecutor`. Model executor clocks can be injected for deterministic tests, and completion before start is rejected. Provenance is internal only: it is neither persisted nor exposed through a public API. A future audit subsystem can consume it; hashes prepare for integrity checks and are not encryption.
 
+## Tool contracts and permissions
+
+Tools currently exist only as provider-neutral contracts: immutable descriptors, requests, results, and a descriptor-only registry. No tools execute, no plugins load, and no filesystem, network, or subprocess operations are performed by this layer. The registry rejects duplicate and unknown IDs. Request arguments accept JSON values, defensively copied into read-only mappings and tuples; non-finite numbers, custom objects, cycles, and structures exceeding 32 levels or 10,000 value nodes are rejected. Results hold output references and safe text fields, never raw exceptions or blobs. Callers must supply safe messages and keep credentials out of arguments.
+
+The deterministic policy evaluator defaults to `DENY`. Trusted descriptors declare exact dotted permission identifiers (no wildcards); all must be explicitly granted, and empty declarations are denied. Network tools additionally require `network.access` even in development. Because destination scope is not modeled yet, air-gapped deployments deny all network tools; grants and approval cannot override this prohibition. After all denial checks, destructive tools and high/critical-risk tools supporting writes yield `REQUIRE_APPROVAL`; other permitted tools yield `ALLOW`. Approval is a separate future authorization step, never a permission grant, and no approval workflow exists yet.
+
+Policy uses trusted registry descriptors and deployment/grant inputs, not agent-supplied descriptions or arguments. It evaluates the whole tool conservatively, not individual argument/resource scopes; future executors must resolve registered tools, enforce operation/resource permissions and any required approval before invocation. No agent-state, routing, or public API integration is added.
+
 ## Two-stage routing
 
 Routing first applies the mandatory, fail-closed sovereign eligibility filter. Only models approved for enablement, the exact active environment, mock-provider restrictions, and all requested capabilities reach the Stage 2 optimizer.
