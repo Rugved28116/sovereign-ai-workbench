@@ -158,6 +158,9 @@ class ToolResultStatus(StrEnum):
     FAILED = "failed"
 
 
+MAX_INLINE_TEXT_BYTES = 1_048_576
+
+
 @dataclass(frozen=True, slots=True)
 class ToolResult:
     request_id: str
@@ -166,6 +169,7 @@ class ToolResult:
     output_reference: str | None = None
     safe_message: str | None = None
     error_code: str | None = None
+    text_content: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.request_id)
@@ -175,13 +179,27 @@ class ToolResult:
         for value in (self.output_reference, self.safe_message, self.error_code):
             if value is not None:
                 _text(value)
+        if self.text_content is not None and type(self.text_content) is not str:
+            raise ToolValidationError("Inline text must be a string")
+        if self.text_content is not None:
+            try:
+                text_size = len(self.text_content.encode("utf-8", errors="strict"))
+            except UnicodeEncodeError as error:
+                raise ToolValidationError("Inline text must be valid UTF-8") from error
+            if text_size > MAX_INLINE_TEXT_BYTES:
+                raise ToolValidationError("Inline text exceeds the result limit")
         if self.status is ToolResultStatus.FAILED:
             if self.error_code is None or self.safe_message is None:
                 raise ToolValidationError("Failure requires safe code and message")
-            if self.output_reference is not None:
+            if self.output_reference is not None or self.text_content is not None:
                 raise ToolValidationError("Failure cannot claim successful output")
-        elif self.error_code is not None:
-            raise ToolValidationError("Success cannot contain an error code")
+        else:
+            if self.error_code is not None:
+                raise ToolValidationError("Success cannot contain an error code")
+            if self.output_reference is not None and self.text_content is not None:
+                raise ToolValidationError(
+                    "Success must use exactly one output channel"
+                )
 
 
 class Tool(Protocol):

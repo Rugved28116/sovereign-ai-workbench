@@ -203,5 +203,68 @@ def test_results_are_immutable_references_and_safe_fields_only():
     assert failure.output_reference is None
 
 
+def test_tool_result_preserves_legacy_positional_field_order():
+    minimal = ToolResult(
+        "request-0",
+        "tool-1",
+        ToolResultStatus.SUCCEEDED,
+    )
+    message_only = ToolResult(
+        "request-0-message",
+        "tool-1",
+        ToolResultStatus.SUCCEEDED,
+        None,
+        "Tool completed without output",
+    )
+    success = ToolResult(
+        "request-1",
+        "tool-1",
+        ToolResultStatus.SUCCEEDED,
+        "output-1",
+        "Tool completed",
+    )
+    failure = ToolResult(
+        "request-2",
+        "tool-1",
+        ToolResultStatus.FAILED,
+        None,
+        "Tool failed",
+        "tool_failed",
+    )
+    inline = ToolResult(
+        "request-3",
+        "tool-1",
+        ToolResultStatus.SUCCEEDED,
+        text_content="bounded text",
+    )
+
+    assert minimal.output_reference is None
+    assert minimal.safe_message is None
+    assert minimal.error_code is None
+    assert minimal.text_content is None
+    assert message_only.output_reference is None
+    assert message_only.safe_message == "Tool completed without output"
+    assert message_only.error_code is None
+    assert message_only.text_content is None
+    assert success.output_reference == "output-1"
+    assert success.safe_message == "Tool completed"
+    assert success.error_code is None
+    assert success.text_content is None
+    assert failure.output_reference is None
+    assert failure.safe_message == "Tool failed"
+    assert failure.error_code == "tool_failed"
+    assert failure.text_content is None
+    assert inline.text_content == "bounded text"
+
+    with pytest.raises(ToolValidationError):
+        ToolResult(
+            "request-4",
+            "tool-1",
+            ToolResultStatus.SUCCEEDED,
+            output_reference="output-1",
+            text_content="bounded text",
+        )
+
+
 def test_identical_inputs_produce_identical_decisions():
     assert [evaluate(grants=frozenset({READ})) for _ in range(5)] == [Decision.ALLOW] * 5
