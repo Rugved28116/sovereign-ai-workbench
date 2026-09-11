@@ -42,6 +42,12 @@ The classifier is currently a conservative keyword-and-phrase ruleset. It perfor
 
 Plans are metadata only and are not executed. `/v1/generate` still routes the complete current requirement set to one model; it does not invoke stages, split work across models, or weaken capabilities. Development responses expose inferred plans for inspection, while non-development responses omit them. Any future stage execution must independently re-enter sovereign eligibility and routing before a model is selected. Unsupported or non-canonical capability sequences fail closed rather than being dropped, invented, or reordered.
 
+## Agent execution state
+
+The provider-neutral execution domain can now convert a `TaskPlan` into an immutable `AgentTask` snapshot containing ordered `AgentStep` values. Task and step state changes use validated transition methods that return new snapshots, with explicit caller-supplied timestamps and a revision incremented exactly once per transition. Results are limited to immutable text or serialized structured content, and errors are valid only on failed steps. Invalid transitions and inconsistent terminal states fail with typed execution-state errors. When a step fails, the task fails atomically: other running steps become `cancelled`, pending steps become `skipped`, and completed terminal steps are preserved.
+
+The domain exposes a compare-and-swap validation contract that rejects an expected revision which does not match the current snapshot. It performs no storage operation and cannot prevent stale writes by itself; future persistence must compare the expected and current revisions and commit the replacement atomically. This is a state model only. No agent stages, models, tools, files, or network operations are executed, and `/v1/generate` is unchanged. A future orchestrator may operate through these values, but each eventual stage must independently pass normal sovereign eligibility and routing before execution.
+
 ## Two-stage routing
 
 Routing first applies the mandatory, fail-closed sovereign eligibility filter. Only models approved for enablement, the exact active environment, mock-provider restrictions, and all requested capabilities reach the Stage 2 optimizer.

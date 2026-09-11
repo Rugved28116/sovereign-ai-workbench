@@ -49,6 +49,36 @@ class UnsupportedTaskRequirementsError(PlanningError):
     code = "unsupported_task_requirements"
 
 
+class ExecutionStateError(SovereignAPIError):
+    """Base class for invalid agent execution state or transitions."""
+
+    code = "execution_state_error"
+
+
+class InvalidExecutionStateError(ExecutionStateError):
+    """Raised when an execution-state value violates domain invariants."""
+
+    code = "invalid_execution_state"
+
+
+class InvalidTaskTransitionError(ExecutionStateError):
+    """Raised when an AgentTask transition is not allowed."""
+
+    code = "invalid_task_transition"
+
+
+class InvalidStepTransitionError(ExecutionStateError):
+    """Raised when an AgentStep transition is not allowed."""
+
+    code = "invalid_step_transition"
+
+
+class StaleAgentTaskRevisionError(ExecutionStateError):
+    """Raised when a task replacement is based on a stale revision."""
+
+    code = "stale_agent_task_revision"
+
+
 class UnsupportedProviderError(SovereignAPIError):
     """Raised when a routed model has no configured provider adapter."""
 
