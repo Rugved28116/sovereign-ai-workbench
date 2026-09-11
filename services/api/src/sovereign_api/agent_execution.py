@@ -13,6 +13,7 @@ from sovereign_api.errors import (
     StaleAgentTaskRevisionError,
 )
 from sovereign_api.task_planning import TaskPlan, TaskStageType
+from sovereign_api.execution_provenance import ExecutionProvenance, result_digest
 
 
 class TaskStatus(StrEnum):
@@ -56,6 +57,25 @@ class StepResult:
 
 
 @dataclass(frozen=True, slots=True)
+class StageExecutionRecord:
+    """Internal successful execution envelope; result text stays provider-neutral."""
+
+    result: StepResult
+    provenance: ExecutionProvenance
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.result) is not StepResult
+            or type(self.provenance) is not ExecutionProvenance
+            or not self.provenance.success
+            or self.provenance.result_digest != result_digest(
+                self.result.output_type.value, self.result.content
+            )
+        ):
+            raise InvalidExecutionStateError("Execution record does not match its result")
+
+
+@dataclass(frozen=True, slots=True)
 class AgentStep:
     """Immutable state for one planned stage."""
 
@@ -65,6 +85,7 @@ class AgentStep:
     status: StepStatus = StepStatus.PENDING
     result: StepResult | None = None
     error: str | None = None
+    provenance: ExecutionProvenance | None = None
 
     def __post_init__(self) -> None:
         capabilities = tuple(self.required_capabilities)
@@ -117,17 +138,32 @@ class AgentStep:
                 "results are limited to succeeded steps and errors to failed steps"
             )
 
+        if self.provenance is not None:
+            provenance = self.provenance
+            if (
+                type(provenance) is not ExecutionProvenance
+                or provenance.stage_id != self.stage_id
+                or provenance.required_capabilities != self.required_capabilities
+                or self.status not in {StepStatus.SUCCEEDED, StepStatus.FAILED}
+                or provenance.success != (self.status is StepStatus.SUCCEEDED)
+            ):
+                raise InvalidExecutionStateError("Provenance does not match step state")
+            if self.result is not None and provenance.result_digest != result_digest(
+                self.result.output_type.value, self.result.content
+            ):
+                raise InvalidExecutionStateError("Provenance digest does not match result")
+
     def start(self) -> AgentStep:
         self._require_status(StepStatus.PENDING, StepStatus.RUNNING)
         return replace(self, status=StepStatus.RUNNING)
 
-    def succeed(self, result: StepResult) -> AgentStep:
+    def succeed(self, result: StepResult, *, provenance: ExecutionProvenance | None = None) -> AgentStep:
         self._require_status(StepStatus.RUNNING, StepStatus.SUCCEEDED)
-        return replace(self, status=StepStatus.SUCCEEDED, result=result)
+        return replace(self, status=StepStatus.SUCCEEDED, result=result, provenance=provenance)
 
-    def fail(self, error: str) -> AgentStep:
+    def fail(self, error: str, *, provenance: ExecutionProvenance | None = None) -> AgentStep:
         self._require_status(StepStatus.RUNNING, StepStatus.FAILED)
-        return replace(self, status=StepStatus.FAILED, error=error)
+        return replace(self, status=StepStatus.FAILED, error=error, provenance=provenance)
 
     def skip(self) -> AgentStep:
         self._require_status(StepStatus.PENDING, StepStatus.SKIPPED)
@@ -223,22 +259,24 @@ class AgentTask:
         )
 
     def succeed_step(
-        self, stage_id: str, result: StepResult, *, updated_at: datetime
+        self, stage_id: str, result: StepResult, *, updated_at: datetime,
+        provenance: ExecutionProvenance | None = None,
     ) -> AgentTask:
         self._require_running()
         return self._replace_step(
             stage_id,
-            self._step(stage_id).succeed(result),
+            self._step(stage_id).succeed(result, provenance=provenance),
             updated_at=updated_at,
         )
 
     def fail_step(
-        self, stage_id: str, error: str, *, updated_at: datetime
+        self, stage_id: str, error: str, *, updated_at: datetime,
+        provenance: ExecutionProvenance | None = None,
     ) -> AgentTask:
         """Fail one required step and the containing task atomically."""
         self._require_running()
         self._require_valid_transition_time(updated_at)
-        failed_step = self._step(stage_id).fail(error)
+        failed_step = self._step(stage_id).fail(error, provenance=provenance)
         terminal_steps = tuple(
             failed_step
             if step.stage_id == stage_id

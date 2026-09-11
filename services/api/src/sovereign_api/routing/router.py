@@ -16,6 +16,7 @@ from sovereign_api.routing.optimizer import (
 @dataclass(frozen=True, slots=True)
 class RouteDecision:
     model: ModelDefinition
+    environment: DeploymentEnvironment
 
 
 def _is_approved_selection(
@@ -99,4 +100,6 @@ class DeterministicModelRouter:
                 "Stage 2 optimizer returned an unknown or altered candidate"
             )
 
-        return RouteDecision(model=approved_models[selected_candidate.model_id])
+        return RouteDecision(
+            model=approved_models[selected_candidate.model_id], environment=self._environment
+        )

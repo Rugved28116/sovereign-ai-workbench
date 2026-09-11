@@ -1,6 +1,7 @@
 """Routing-backed stage execution through the existing provider contract."""
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -8,6 +9,10 @@ from pydantic import TypeAdapter
 
 from sovereign_api.agent_execution import (
     AgentStep, AgentTask, StepOutputType, StepResult, StepStatus, TaskStatus,
+    StageExecutionRecord,
+)
+from sovereign_api.execution_provenance import (
+    ExecutionProvenance, RoutedStageExecutionError, result_digest,
 )
 from sovereign_api.contracts import ModelRequest, ModelResponse
 from sovereign_api.errors import ProviderError, RoutingError, StageExecutionError
@@ -79,38 +84,60 @@ class ModelStageExecutor:
         execution_input: TaskExecutionInput,
         router: DeterministicModelRouter,
         providers: Mapping[str, ModelProvider],
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._input = execution_input
         self._router = router
         self._providers = MappingProxyType(dict(providers))
+        self._clock = clock if clock is not None else lambda: datetime.now(UTC)
 
-    async def execute(self, task: AgentTask, step: AgentStep) -> StepResult:
+    async def execute(self, task: AgentTask, step: AgentStep) -> StageExecutionRecord:
         context = build_stage_context(self._input, task, step)
         try:
             decision = self._router.route(frozenset(step.required_capabilities))
         except RoutingError as error:
             raise StageExecutionError(MODEL_STAGE_FAILURE) from error
 
+        # Capture approved routing facts before invoking any provider code.
+        stage_id = step.stage_id
+        capabilities = tuple(step.required_capabilities)
+        model_id = decision.model.id
+        provider_key = decision.model.provider
+        environment = decision.environment
+        started_at = self._clock()
+
+        def provenance(result: StepResult | None = None) -> ExecutionProvenance:
+            return ExecutionProvenance(
+                stage_id=stage_id, model_id=model_id, provider=provider_key,
+                required_capabilities=capabilities, routing_environment=environment,
+                started_at=started_at, completed_at=self._clock(),
+                success=result is not None,
+                result_digest=None if result is None else result_digest(
+                    result.output_type.value, result.content
+                ),
+            )
+
         # Same approved-provider lookup used by the generation composition root.
-        provider = self._providers.get(decision.model.provider)
+        provider = self._providers.get(provider_key)
         if provider is None:
-            raise StageExecutionError(MODEL_STAGE_FAILURE)
+            raise RoutedStageExecutionError(MODEL_STAGE_FAILURE, provenance())
 
         try:
             response = await provider.generate(
-                ModelRequest(model_id=decision.model.id, prompt=context)
+                ModelRequest(model_id=model_id, prompt=context)
             )
         except ProviderError as error:
-            raise StageExecutionError(MODEL_STAGE_FAILURE) from error
+            raise RoutedStageExecutionError(MODEL_STAGE_FAILURE, provenance()) from error
         except Exception as error:
             # Provider messages and infrastructure details are never task errors.
-            raise StageExecutionError(MODEL_STAGE_FAILURE) from error
+            raise RoutedStageExecutionError(MODEL_STAGE_FAILURE, provenance()) from error
 
         if (
             type(response) is not ModelResponse
-            or response.model_id != decision.model.id
+            or response.model_id != model_id
             or type(response.content) is not str
             or not response.content.strip()
         ):
-            raise StageExecutionError(MODEL_STAGE_FAILURE)
-        return StepResult(StepOutputType.TEXT, response.content)
+            raise RoutedStageExecutionError(MODEL_STAGE_FAILURE, provenance())
+        result = StepResult(StepOutputType.TEXT, response.content)
+        return StageExecutionRecord(result, provenance(result))

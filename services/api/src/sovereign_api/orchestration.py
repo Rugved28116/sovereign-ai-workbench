@@ -12,7 +12,9 @@ from sovereign_api.agent_execution import (
     AgentTask,
     StepOutputType,
     StepResult,
+    StageExecutionRecord,
 )
+from sovereign_api.execution_provenance import RoutedStageExecutionError
 from sovereign_api.errors import StageExecutionError
 from sovereign_api.task_planning import TaskPlan
 
@@ -24,7 +26,7 @@ UNEXPECTED_STAGE_FAILURE = "Stage execution failed unexpectedly"
 class StageExecutor(Protocol):
     """Execute one logical stage without exposing infrastructure details."""
 
-    async def execute(self, task: AgentTask, step: AgentStep) -> StepResult:
+    async def execute(self, task: AgentTask, step: AgentStep) -> StepResult | StageExecutionRecord:
         """Return a typed result or raise StageExecutionError."""
         ...
 
@@ -86,6 +88,7 @@ class SequentialTaskOrchestrator:
                     running_step.stage_id,
                     str(error),
                     updated_at=self._clock(),
+                    provenance=error.provenance if isinstance(error, RoutedStageExecutionError) else None,
                 )
             except Exception:
                 return task.fail_step(
@@ -96,8 +99,9 @@ class SequentialTaskOrchestrator:
 
             task = task.succeed_step(
                 running_step.stage_id,
-                result,
+                result.result if isinstance(result, StageExecutionRecord) else result,
                 updated_at=self._clock(),
+                provenance=result.provenance if isinstance(result, StageExecutionRecord) else None,
             )
 
         return task.succeed(updated_at=self._clock())

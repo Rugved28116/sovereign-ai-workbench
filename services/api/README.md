@@ -60,6 +60,12 @@ Stage context contains the original prompt, ordered earlier successful results l
 
 Expected routing failures, unavailable providers, provider exceptions, and malformed responses become a fixed safe `StageExecutionError`; the orchestrator then fails the task and dispositions remaining work. Unexpected router or optimizer defects propagate to the orchestrator's separate, sanitized unexpected-failure path. There are no retries or fallback providers. This executor adds no direct network implementation: future eligible runtime adapters use their existing transport and sovereignty controls. No runtime or model is installed, and the shared registry is unchanged.
 
+## Internal execution provenance
+
+Internal routed-stage provenance is stored in optional immutable `AgentStep.provenance`. Successful model executions return a `StageExecutionRecord` containing the unchanged `StepResult` and separate `ExecutionProvenance`; routed failures carry provenance through the existing safe failure path. The orchestrator preserves these facts through normal state transitions. The record contains the approved model/provider identity, stage ID, exact requested capabilities, routing environment, timezone-aware start/completion timestamps, success flag, and successful-result digest. It contains no prompt, response payload, endpoint, configuration, or exception details.
+
+The digest is SHA-256 over UTF-8 JSON containing `content` and `output_type`, with sorted keys, compact separators, and unescaped Unicode. Content strings are preserved exactly, including serialized structured content; this does not normalize semantically equivalent structured strings. Failed executions have no digest. No provenance is fabricated when routing fails before approval, or for skipped stages and `MockStageExecutor`. Model executor clocks can be injected for deterministic tests, and completion before start is rejected. Provenance is internal only: it is neither persisted nor exposed through a public API. A future audit subsystem can consume it; hashes prepare for integrity checks and are not encryption.
+
 ## Two-stage routing
 
 Routing first applies the mandatory, fail-closed sovereign eligibility filter. Only models approved for enablement, the exact active environment, mock-provider restrictions, and all requested capabilities reach the Stage 2 optimizer.
