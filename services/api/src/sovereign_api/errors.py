@@ -79,6 +79,18 @@ class StaleAgentTaskRevisionError(ExecutionStateError):
     code = "stale_agent_task_revision"
 
 
+class OrchestrationError(SovereignAPIError):
+    """Base class for failures at the task orchestration boundary."""
+
+    code = "orchestration_error"
+
+
+class StageExecutionError(OrchestrationError):
+    """Known, safely reportable failure from a stage executor."""
+
+    code = "stage_execution_error"
+
+
 class UnsupportedProviderError(SovereignAPIError):
     """Raised when a routed model has no configured provider adapter."""
 

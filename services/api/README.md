@@ -48,6 +48,12 @@ The provider-neutral execution domain can now convert a `TaskPlan` into an immut
 
 The domain exposes a compare-and-swap validation contract that rejects an expected revision which does not match the current snapshot. It performs no storage operation and cannot prevent stale writes by itself; future persistence must compare the expected and current revisions and commit the replacement atomically. This is a state model only. No agent stages, models, tools, files, or network operations are executed, and `/v1/generate` is unchanged. A future orchestrator may operate through these values, but each eventual stage must independently pass normal sovereign eligibility and routing before execution.
 
+## Minimal task orchestration
+
+The provider-neutral `SequentialTaskOrchestrator` can now process a `TaskPlan` in order through a pluggable asynchronous `StageExecutor`. It uses only the latest immutable `AgentTask` returned by the execution-state transition API, so each task or step transition advances the task revision without direct field mutation. Known executor failures become failed task snapshots using the existing atomic failure disposition; unexpected exceptions receive a fixed safe error message, and execution stops immediately.
+
+`MockStageExecutor` supplies deterministic, network-free results and optional deterministic failure injection for development and tests only. No public orchestration endpoint, persistence, parallel execution, live cancellation, tool execution, or real model execution is included, and `/v1/generate` remains unchanged.
+
 ## Two-stage routing
 
 Routing first applies the mandatory, fail-closed sovereign eligibility filter. Only models approved for enablement, the exact active environment, mock-provider restrictions, and all requested capabilities reach the Stage 2 optimizer.
