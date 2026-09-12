@@ -16,6 +16,12 @@ class ToolValidationError(SovereignAPIError):
     code = "invalid_tool_contract"
 
 
+class SafeToolError(SovereignAPIError):
+    """A tool's typed, caller-safe operational failure."""
+
+    code = "tool_operational_error"
+
+
 class UnknownToolError(SovereignAPIError):
     code = "unknown_tool"
 
@@ -203,7 +209,10 @@ class ToolResult:
 
 
 class Tool(Protocol):
-    """Future implementation contract; no implementation or invocation exists here."""
+    """Provider-neutral contract for an explicitly registered implementation."""
+
+    @property
+    def tool_id(self) -> str: ...
 
     @property
     def descriptor(self) -> ToolDescriptor: ...

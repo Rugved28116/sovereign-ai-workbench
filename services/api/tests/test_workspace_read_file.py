@@ -954,6 +954,10 @@ def test_require_approval_does_not_execute() -> None:
         descriptor: ToolDescriptor
         called: bool = False
 
+        @property
+        def tool_id(self) -> str:
+            return self.descriptor.tool_id
+
         async def execute(self, request: ToolRequest) -> ToolResult:
             self.called = True
             raise AssertionError("tool must not execute")

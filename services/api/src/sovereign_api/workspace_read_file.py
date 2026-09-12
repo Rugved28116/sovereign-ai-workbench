@@ -9,8 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Mapping
 
-from sovereign_api.errors import SovereignAPIError
+from sovereign_api.tool_execution import (
+    ExecutableToolRegistry,
+    PolicyEnforcedToolExecutor,
+)
+from sovereign_api.tool_policy import DeterministicToolPolicyEvaluator
 from sovereign_api.tool_contracts import (
+    SafeToolError,
     ToolDescriptor,
     ToolPermission,
     ToolRegistry,
@@ -44,7 +49,7 @@ WORKSPACE_READ_FILE_DESCRIPTOR = ToolDescriptor(
 WORKSPACE_TOOL_REGISTRY = ToolRegistry((WORKSPACE_READ_FILE_DESCRIPTOR,))
 
 
-class WorkspaceReadFileError(SovereignAPIError):
+class WorkspaceReadFileError(SafeToolError):
     code = "workspace_read_file_error"
 
 
@@ -414,6 +419,10 @@ class WorkspaceReadFileTool:
     workspace_root: Path | str
     descriptor: ToolDescriptor = WORKSPACE_READ_FILE_DESCRIPTOR
 
+    @property
+    def tool_id(self) -> str:
+        return WORKSPACE_READ_FILE_TOOL_ID
+
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
@@ -463,3 +472,15 @@ class WorkspaceReadFileTool:
             text_content=content,
             safe_message="Workspace file read successfully",
         )
+
+
+def create_workspace_tool_executor(
+    workspace_root: Path | str,
+) -> PolicyEnforcedToolExecutor:
+    """Explicitly compose the sole production executable tool."""
+
+    return PolicyEnforcedToolExecutor(
+        registry=WORKSPACE_TOOL_REGISTRY,
+        policy_evaluator=DeterministicToolPolicyEvaluator(),
+        tools=ExecutableToolRegistry((WorkspaceReadFileTool(workspace_root),)),
+    )
