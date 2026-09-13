@@ -51,6 +51,7 @@ class StageExecutionResult:
     selected_model_id: str | None = None
     safe_message: str | None = None
     error_code: str | None = None
+    model_invocations: int = 0
 
     def __post_init__(self) -> None:
         if type(self.stage_id) is not str or not self.stage_id.strip():
@@ -67,6 +68,8 @@ class StageExecutionResult:
                 raise InvalidStageExecutionResultError("Stage result field is invalid")
         if self.selected_model_id is not None and not valid_model_id(self.selected_model_id):
             raise InvalidStageExecutionResultError("Selected model ID is invalid")
+        if type(self.model_invocations) is not int or self.model_invocations not in (0, 1):
+            raise InvalidStageExecutionResultError("Model invocation count is invalid")
         if self.status is StageStatus.COMPLETED:
             if type(self.text_content) is not str or self.error_code is not None:
                 raise InvalidStageExecutionResultError("Completed stage result is invalid")
@@ -85,15 +88,27 @@ class StageExecutionResult:
     def failed(
         cls, stage_id: str, *, error_code: str,
         selected_model_id: str | None = None,
+        model_invocations: int = 0,
     ) -> StageExecutionResult:
         return cls(
             stage_id=stage_id, status=StageStatus.FAILED,
             selected_model_id=selected_model_id,
             safe_message=_SAFE_FAILURE, error_code=error_code,
+            model_invocations=model_invocations,
         )
 
 
+@dataclass(frozen=True, slots=True)
+class StageCoordinationReport:
+    """One coordinator call's state and explicitly reported model-call count."""
+
+    state: AgentTaskState
+    model_invocations: int
+
+
 class StageExecutor(Protocol):
+    """Execute one stage; report zero or one actual model-provider calls."""
+
     async def execute(
         self, task: AgentTaskState, stage: TaskStage, prompt: str,
     ) -> StageExecutionResult: ...
@@ -135,11 +150,13 @@ class RoutedAgentStageExecutor:
         except ProviderError:
             return StageExecutionResult.failed(
                 stage.stage_id, error_code="provider_failed", selected_model_id=model_id,
+                model_invocations=1,
             )
         except Exception:
             # Provider implementations are an external-runtime boundary.
             return StageExecutionResult.failed(
                 stage.stage_id, error_code="provider_failed", selected_model_id=model_id,
+                model_invocations=1,
             )
 
         if (
@@ -151,25 +168,26 @@ class RoutedAgentStageExecutor:
         ):
             return StageExecutionResult.failed(
                 stage.stage_id, error_code="provider_response_invalid",
-                selected_model_id=model_id,
+                selected_model_id=model_id, model_invocations=1,
             )
         try:
             encoded = response.content.encode("utf-8", errors="strict")
         except UnicodeEncodeError:
             return StageExecutionResult.failed(
                 stage.stage_id, error_code="provider_response_invalid",
-                selected_model_id=model_id,
+                selected_model_id=model_id, model_invocations=1,
             )
         if len(encoded) > MAX_STAGE_OUTPUT_BYTES:
             return StageExecutionResult.failed(
                 stage.stage_id, error_code="provider_response_invalid",
-                selected_model_id=model_id,
+                selected_model_id=model_id, model_invocations=1,
             )
         return StageExecutionResult(
             stage_id=stage.stage_id,
             status=StageStatus.COMPLETED,
             text_content=response.content,
             selected_model_id=model_id,
+            model_invocations=1,
         )
 
 
@@ -224,6 +242,11 @@ class StageExecutionCoordinator:
     async def execute_one(
         self, task: AgentTaskState, stage: TaskStage,
     ) -> AgentTaskState:
+        return (await self.execute_one_with_report(task, stage)).state
+
+    async def execute_one_with_report(
+        self, task: AgentTaskState, stage: TaskStage,
+    ) -> StageCoordinationReport:
         if type(task) is not AgentTaskState or type(stage) is not TaskStage:
             raise InvalidStageCoordinationError("Task or stage is invalid")
         if task.task_status not in (TaskStatus.PENDING, TaskStatus.RUNNING):
@@ -325,6 +348,7 @@ class StageExecutionCoordinator:
                 result = StageExecutionResult.failed(
                     stage.stage_id, error_code="output_store_failed",
                     selected_model_id=result.selected_model_id,
+                    model_invocations=result.model_invocations,
                 )
             else:
                 current = current.update_stage(
@@ -337,7 +361,7 @@ class StageExecutionCoordinator:
                 if all(item.status is StageStatus.COMPLETED for item in current.stage_states):
                     assert task_complete_at is not None
                     current = current.complete(updated_at=task_complete_at)
-                return current
+                return StageCoordinationReport(current, result.model_invocations)
 
         if result.status is StageStatus.FAILED:
             # Error text from pluggable executors is never copied into task state.
@@ -362,4 +386,4 @@ class StageExecutionCoordinator:
                 ),
                 updated_at=terminal_at,
             )
-        return current
+        return StageCoordinationReport(current, result.model_invocations)
