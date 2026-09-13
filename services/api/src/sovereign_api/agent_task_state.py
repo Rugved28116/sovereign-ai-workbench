@@ -14,6 +14,7 @@ from sovereign_api.errors import (
     InvalidTaskTransitionError,
 )
 from sovereign_api.prompt_validation import Prompt
+from sovereign_api.registry.models import valid_model_id
 from sovereign_api.task_classification import TaskClass
 from sovereign_api.task_planning import TaskPlan, TaskStageType
 
@@ -80,6 +81,8 @@ class StageExecutionState:
                 raise InvalidExecutionStateError(
                     f"{name} must be None or a non-empty string"
                 )
+        if self.selected_model_id is not None and not valid_model_id(self.selected_model_id):
+            raise InvalidExecutionStateError("selected_model_id is invalid")
 
         if self.status is StageStatus.COMPLETED:
             if self.output_reference is None:
@@ -122,21 +125,34 @@ class StageExecutionState:
             selected_model_id=selected_model_id,
         )
 
-    def complete(self, *, output_reference: str) -> StageExecutionState:
+    def complete(
+        self, *, output_reference: str, selected_model_id: str | None = None
+    ) -> StageExecutionState:
         self._require_status(StageStatus.RUNNING, StageStatus.COMPLETED)
+        self._require_same_selected_model(selected_model_id)
         return replace(
             self,
             status=StageStatus.COMPLETED,
             output_reference=output_reference,
+            selected_model_id=(
+                self.selected_model_id if selected_model_id is None else selected_model_id
+            ),
         )
 
-    def fail(self, *, error_code: str, safe_message: str) -> StageExecutionState:
+    def fail(
+        self, *, error_code: str, safe_message: str,
+        selected_model_id: str | None = None,
+    ) -> StageExecutionState:
         self._require_status(StageStatus.RUNNING, StageStatus.FAILED)
+        self._require_same_selected_model(selected_model_id)
         return replace(
             self,
             status=StageStatus.FAILED,
             error_code=error_code,
             safe_message=safe_message,
+            selected_model_id=(
+                self.selected_model_id if selected_model_id is None else selected_model_id
+            ),
         )
 
     def cancel(self) -> StageExecutionState:
@@ -155,6 +171,14 @@ class StageExecutionState:
                 f"cannot transition stage from {self.status.value} "
                 f"to {destination.value}"
             )
+
+    def _require_same_selected_model(self, selected_model_id: str | None) -> None:
+        if (
+            self.selected_model_id is not None
+            and selected_model_id is not None
+            and selected_model_id != self.selected_model_id
+        ):
+            raise InvalidStepTransitionError("selected model ID cannot change")
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,6 +379,13 @@ class AgentTaskState:
             raise InvalidExecutionStateError(
                 "stage updates cannot reinterpret plan requirements"
             )
+        if (
+            current.selected_model_id is not None
+            and stage.selected_model_id != current.selected_model_id
+        ):
+            raise InvalidExecutionStateError(
+                "stage updates cannot change an already selected model"
+            )
         expected_stage = self._expected_stage_transition(current, stage)
         if stage != expected_stage:
             raise InvalidExecutionStateError(
@@ -391,7 +422,8 @@ class AgentTaskState:
         if transition == (StageStatus.RUNNING, StageStatus.COMPLETED):
             assert replacement.output_reference is not None
             return current.complete(
-                output_reference=replacement.output_reference
+                output_reference=replacement.output_reference,
+                selected_model_id=replacement.selected_model_id,
             )
         if transition == (StageStatus.RUNNING, StageStatus.FAILED):
             assert replacement.error_code is not None
@@ -399,6 +431,7 @@ class AgentTaskState:
             return current.fail(
                 error_code=replacement.error_code,
                 safe_message=replacement.safe_message,
+                selected_model_id=replacement.selected_model_id,
             )
         if transition == (StageStatus.RUNNING, StageStatus.CANCELLED):
             return current.cancel()

@@ -4,6 +4,7 @@ import pytest
 
 from sovereign_api.errors import RegistryValidationError
 from sovereign_api.registry import load_registry
+from sovereign_api.registry.models import MAX_MODEL_ID_LENGTH
 
 from conftest import model_data, registry_data, start_app, write_registry
 
@@ -16,6 +17,32 @@ def test_valid_registry_loads(tmp_path: Path) -> None:
     assert registry.schema_version == 1
     assert registry.models[0].id == "valid-model"
     assert registry.models[0].metadata.description == "Test model"
+
+
+def test_model_id_at_shared_maximum_loads(tmp_path: Path) -> None:
+    model_id = "m" * MAX_MODEL_ID_LENGTH
+    path = write_registry(tmp_path, registry_data(model_data(model_id)))
+    assert load_registry(path).models[0].id == model_id
+
+
+def test_printable_unicode_model_id_loads_unchanged(tmp_path: Path) -> None:
+    model_id = "modèle-日本語"
+    path = write_registry(tmp_path, registry_data(model_data(model_id)))
+    assert load_registry(path).models[0].id == model_id
+
+
+@pytest.mark.parametrize("model_id", [
+    "m" * (MAX_MODEL_ID_LENGTH + 1),
+    " internal-space", "internal-space ",
+    "m\x00id", "m\x1fid", "m\x7fid", "m\x80id", "m\x9fid",
+    "internal\ncontrol",
+])
+def test_invalid_model_id_fails_during_registry_loading(
+    tmp_path: Path, model_id: str,
+) -> None:
+    path = write_registry(tmp_path, registry_data(model_data(model_id)))
+    with pytest.raises(RegistryValidationError, match="Invalid model registry"):
+        load_registry(path)
 
 
 def test_malformed_yaml_fails(tmp_path: Path) -> None:

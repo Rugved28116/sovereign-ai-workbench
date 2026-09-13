@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Annotated, Self
+from unicodedata import category
 
 from pydantic import (
     BaseModel,
@@ -20,6 +21,19 @@ from sovereign_api.config import DeploymentEnvironment
 MetadataLabel = Annotated[str, StringConstraints(min_length=1, max_length=128)]
 MetadataDescription = Annotated[str, StringConstraints(min_length=1, max_length=1024)]
 MetadataTag = Annotated[str, StringConstraints(min_length=1, max_length=64)]
+MAX_MODEL_ID_LENGTH = 256
+
+
+def valid_model_id(value: object) -> bool:
+    """Shared registry and routed-result model identifier contract."""
+
+    return (
+        type(value) is str
+        and bool(value)
+        and value == value.strip()
+        and len(value) <= MAX_MODEL_ID_LENGTH
+        and not any(category(character) == "Cc" for character in value)
+    )
 
 
 class RegistryMetadata(BaseModel):
@@ -67,7 +81,16 @@ class ModelDefinition(BaseModel):
     priority: StrictInt
     metadata: RegistryMetadata = Field(default_factory=RegistryMetadata)
 
-    @field_validator("id", "provider")
+    @field_validator("id")
+    @classmethod
+    def validate_model_id(cls, value: str) -> str:
+        if not valid_model_id(value):
+            raise ValueError(
+                "model ID must be 1–256 characters without surrounding whitespace or controls"
+            )
+        return value
+
+    @field_validator("provider")
     @classmethod
     def validate_identifier(cls, value: str) -> str:
         if not value or value != value.strip():

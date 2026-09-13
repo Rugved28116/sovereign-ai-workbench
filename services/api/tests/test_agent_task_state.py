@@ -116,6 +116,40 @@ def test_same_explicit_inputs_produce_identical_state() -> None:
     assert first == second
 
 
+@pytest.mark.parametrize("transition", ["complete", "fail"])
+def test_stage_transition_preserves_or_adds_selected_model_id(transition: str) -> None:
+    pending = _state().stage_states[0]
+    for running in (pending.start(), pending.start(selected_model_id="model-a")):
+        for proposed in (None, "model-a"):
+            if transition == "complete":
+                terminal = running.complete(
+                    output_reference="result-1", selected_model_id=proposed,
+                )
+            else:
+                terminal = running.fail(
+                    error_code="safe_failure", safe_message="Stage failed",
+                    selected_model_id=proposed,
+                )
+            assert terminal.selected_model_id == (
+                running.selected_model_id if proposed is None else proposed
+            )
+            assert running.status is StageStatus.RUNNING
+
+
+@pytest.mark.parametrize("transition", ["complete", "fail"])
+def test_stage_transition_rejects_selected_model_replacement(transition: str) -> None:
+    running = _state().stage_states[0].start(selected_model_id="model-a")
+    with pytest.raises(InvalidStepTransitionError):
+        if transition == "complete":
+            running.complete(output_reference="result-1", selected_model_id="model-b")
+        else:
+            running.fail(
+                error_code="safe_failure", safe_message="Stage failed",
+                selected_model_id="model-b",
+            )
+    assert running.selected_model_id == "model-a"
+
+
 def test_state_and_nested_stages_are_frozen() -> None:
     state = _state()
 
