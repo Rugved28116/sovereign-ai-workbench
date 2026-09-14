@@ -18,6 +18,7 @@ from sovereign_api.artifact_reference import valid_artifact_reference
 from sovereign_api.registry.models import valid_model_id
 from sovereign_api.task_classification import TaskClass
 from sovereign_api.task_planning import StageExecutionKind, TaskPlan, TaskStageType
+from sovereign_api.tool_approval import ApprovalRequest
 
 _PROMPT_VALIDATOR = TypeAdapter(Prompt)
 _UTC_OFFSET = timedelta(0)
@@ -29,6 +30,7 @@ class TaskStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    AWAITING_APPROVAL = "awaiting_approval"
 
 
 class StageStatus(StrEnum):
@@ -38,6 +40,7 @@ class StageStatus(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     SKIPPED = "skipped"
+    AWAITING_APPROVAL = "awaiting_approval"
 
 
 class StageOutputKind(StrEnum):
@@ -176,7 +179,8 @@ class StageExecutionState:
         selected_model_id: str | None = None,
         selected_tool_id: str | None = None,
     ) -> StageExecutionState:
-        self._require_status(StageStatus.RUNNING, StageStatus.FAILED)
+        if self.status not in (StageStatus.RUNNING, StageStatus.AWAITING_APPROVAL):
+            raise InvalidStepTransitionError("stage cannot fail from this status")
         self._require_same_selected_model(selected_model_id)
         self._require_same_selected_tool(selected_tool_id)
         return replace(
@@ -191,6 +195,18 @@ class StageExecutionState:
                 self.selected_tool_id if selected_tool_id is None else selected_tool_id
             ),
         )
+
+    def await_approval(self, *, selected_tool_id: str) -> StageExecutionState:
+        self._require_status(StageStatus.RUNNING, StageStatus.AWAITING_APPROVAL)
+        if self.execution_kind is not StageExecutionKind.TOOL:
+            raise InvalidStepTransitionError("only a tool stage may await approval")
+        self._require_same_selected_tool(selected_tool_id)
+        return replace(self, status=StageStatus.AWAITING_APPROVAL,
+                       selected_tool_id=selected_tool_id)
+
+    def resume_approval(self) -> StageExecutionState:
+        self._require_status(StageStatus.AWAITING_APPROVAL, StageStatus.RUNNING)
+        return replace(self, status=StageStatus.RUNNING)
 
     def cancel(self) -> StageExecutionState:
         self._require_status(StageStatus.RUNNING, StageStatus.CANCELLED)
@@ -236,6 +252,7 @@ class AgentTaskState:
     stage_states: tuple[StageExecutionState, ...]
     created_at: datetime
     updated_at: datetime
+    approval_request: ApprovalRequest | None = None
 
     def __post_init__(self) -> None:
         capabilities = tuple(self.required_capabilities)
@@ -272,6 +289,19 @@ class AgentTaskState:
         self._validate_timestamps()
         self._validate_plan_projection()
         self._validate_current_stage()
+        if self.task_status is TaskStatus.AWAITING_APPROVAL:
+            if (
+                type(self.approval_request) is not ApprovalRequest
+                or self.approval_request.task_id != self.task_id
+                or self.approval_request.stage_id != self.current_stage_id
+                or self.approval_request.tool_id != next(
+                    stage.tool_id for stage in self.plan.stages
+                    if stage.stage_id == self.current_stage_id
+                )
+            ):
+                raise InvalidExecutionStateError("approval request does not match task")
+        elif self.approval_request is not None:
+            raise InvalidExecutionStateError("approval request requires suspended task")
 
     @classmethod
     def from_plan(
@@ -396,10 +426,11 @@ class AgentTaskState:
         stage: StageExecutionState,
         *,
         updated_at: datetime,
+        approval_request: ApprovalRequest | None = None,
     ) -> AgentTaskState:
-        if self.task_status is not TaskStatus.RUNNING:
+        if self.task_status not in (TaskStatus.RUNNING, TaskStatus.AWAITING_APPROVAL):
             raise InvalidTaskTransitionError(
-                "stages can change only while the task is running"
+                "stages can change only while the task is active"
             )
         self._require_later_time(updated_at)
         try:
@@ -438,20 +469,31 @@ class AgentTaskState:
             )
 
         stages = self.stage_states[:index] + (stage,) + self.stage_states[index + 1 :]
+        if stage.status is StageStatus.AWAITING_APPROVAL:
+            if type(approval_request) is not ApprovalRequest:
+                raise InvalidExecutionStateError("approval request is required")
+        elif approval_request is not None:
+            raise InvalidExecutionStateError("approval request is not expected")
         current_stage_id = (
-            stage.stage_id if stage.status is StageStatus.RUNNING else None
+            stage.stage_id if stage.status in (StageStatus.RUNNING, StageStatus.AWAITING_APPROVAL)
+            else None
         )
         task_status = self.task_status
         if stage.status is StageStatus.FAILED:
             task_status = TaskStatus.FAILED
         elif stage.status is StageStatus.CANCELLED:
             task_status = TaskStatus.CANCELLED
+        elif stage.status is StageStatus.AWAITING_APPROVAL:
+            task_status = TaskStatus.AWAITING_APPROVAL
+        elif current.status is StageStatus.AWAITING_APPROVAL and stage.status is StageStatus.RUNNING:
+            task_status = TaskStatus.RUNNING
         return replace(
             self,
             task_status=task_status,
             current_stage_id=current_stage_id,
             stage_states=stages,
             updated_at=updated_at,
+            approval_request=approval_request,
         )
 
     @staticmethod
@@ -484,6 +526,17 @@ class AgentTaskState:
             )
         if transition == (StageStatus.RUNNING, StageStatus.CANCELLED):
             return current.cancel()
+        if transition == (StageStatus.RUNNING, StageStatus.AWAITING_APPROVAL):
+            assert replacement.selected_tool_id is not None
+            return current.await_approval(selected_tool_id=replacement.selected_tool_id)
+        if transition == (StageStatus.AWAITING_APPROVAL, StageStatus.RUNNING):
+            return current.resume_approval()
+        if transition == (StageStatus.AWAITING_APPROVAL, StageStatus.FAILED):
+            assert replacement.error_code is not None
+            assert replacement.safe_message is not None
+            return current.fail(error_code=replacement.error_code,
+                                safe_message=replacement.safe_message,
+                                selected_tool_id=replacement.selected_tool_id)
         if transition == (StageStatus.PENDING, StageStatus.SKIPPED):
             return current.skip()
         else:
@@ -563,12 +616,28 @@ class AgentTaskState:
             for stage in self.stage_states
             if stage.status is StageStatus.RUNNING
         )
-        if len(running_ids) > 1 or (
-            running_ids and self.current_stage_id != running_ids[0]
-        ) or (not running_ids and self.current_stage_id is not None):
+        waiting_ids = tuple(
+            stage.stage_id for stage in self.stage_states
+            if stage.status is StageStatus.AWAITING_APPROVAL
+        )
+        active_ids = running_ids + waiting_ids
+        if len(active_ids) > 1 or (
+            active_ids and self.current_stage_id != active_ids[0]
+        ) or (not active_ids and self.current_stage_id is not None):
             raise InvalidExecutionStateError(
-                "current_stage_id must identify the sole running stage"
+                "current_stage_id must identify the sole active stage"
             )
+        if self.task_status is TaskStatus.AWAITING_APPROVAL:
+            if len(waiting_ids) != 1 or running_ids:
+                raise InvalidExecutionStateError("suspended task requires one waiting stage")
+            index = next(i for i, stage in enumerate(self.stage_states)
+                         if stage.status is StageStatus.AWAITING_APPROVAL)
+            if any(stage.status is not StageStatus.COMPLETED for stage in self.stage_states[:index]) or any(
+                stage.status is not StageStatus.PENDING for stage in self.stage_states[index + 1:]
+            ):
+                raise InvalidExecutionStateError("suspended stages must preserve plan order")
+        elif waiting_ids:
+            raise InvalidExecutionStateError("waiting stage requires suspended task")
         if self.task_status is TaskStatus.PENDING and any(
             stage.status is not StageStatus.PENDING
             for stage in self.stage_states

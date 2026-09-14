@@ -12,6 +12,7 @@ from sovereign_api.agent_task_state import (
 )
 from sovereign_api.errors import OrchestrationError
 from sovereign_api.task_planning import StageExecutionKind, TaskPlan, TaskStage, TaskStageType
+from sovereign_api.tool_approval import ApprovalRequest
 
 
 MAX_RUN_STAGES = 16
@@ -108,6 +109,22 @@ def revalidate_agent_task_state(state: AgentTaskState) -> AgentTaskState:
             stage_states=stages,
             created_at=state.created_at,
             updated_at=state.updated_at,
+            approval_request=(
+                ApprovalRequest(
+                    approval_id=state.approval_request.approval_id,
+                    request_id=state.approval_request.request_id,
+                    task_id=state.approval_request.task_id,
+                    stage_id=state.approval_request.stage_id,
+                    tool_id=state.approval_request.tool_id,
+                    operation=state.approval_request.operation,
+                    requested_permissions=state.approval_request.requested_permissions,
+                    risk_level=state.approval_request.risk_level,
+                    side_effect_level=state.approval_request.side_effect_level,
+                    created_at=state.approval_request.created_at,
+                    safe_summary=state.approval_request.safe_summary,
+                    request_fingerprint=state.approval_request.request_fingerprint,
+                ) if state.approval_request is not None else None
+            ),
         )
         if validated != state:
             raise InvalidTaskRunError("Task state is invalid")
@@ -126,6 +143,7 @@ class TaskRunResult:
     terminal_status: TaskStatus
     safe_message: str
     error_code: str | None = None
+    approval_request: ApprovalRequest | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -141,6 +159,7 @@ class TaskRunResult:
             or (self.error_code is not None and (
                 type(self.error_code) is not str or not self.error_code
             ))
+            or self.approval_request != self.final_state.approval_request
         ):
             raise InvalidTaskRunError("Task run result is invalid")
 
@@ -172,6 +191,8 @@ class TaskPlanRunner:
         state = initial_state
         if state.task_status in _TERMINAL:
             return self._result(state, 0, 0)
+        if state.task_status is TaskStatus.AWAITING_APPROVAL:
+            return self._result(state, 0, 0, error_code="approval_required")
         if len(state.plan.stages) > self._max_stages:
             raise InvalidTaskRunError("Task plan exceeds the run stage limit")
         if state.current_stage_id is not None:
@@ -239,6 +260,7 @@ class TaskPlanRunner:
                     or next_state.stage_states[next_index + 1:] != previous.stage_states[next_index + 1:]
                     or next_state.stage_states[next_index].status not in (
                         StageStatus.COMPLETED, StageStatus.FAILED, StageStatus.CANCELLED,
+                        StageStatus.AWAITING_APPROVAL,
                     )
                 ):
                     raise InvalidTaskRunError("Coordinator did not advance exactly one stage")
@@ -249,6 +271,11 @@ class TaskPlanRunner:
             else:
                 state = next_state
                 stages_executed += 1
+                if state.task_status is TaskStatus.AWAITING_APPROVAL:
+                    return self._result(
+                        state, stages_executed, model_invocations,
+                        error_code="approval_required",
+                    )
                 continue
             raise TaskRunExecutionError(
                 last_confirmed_state=previous,
@@ -269,6 +296,7 @@ class TaskPlanRunner:
             TaskStatus.FAILED: "Task failed",
             TaskStatus.CANCELLED: "Task cancelled",
             TaskStatus.RUNNING: "Task run limit reached",
+            TaskStatus.AWAITING_APPROVAL: "Task awaiting approval",
         }.get(state.task_status, "Task not started")
         return TaskRunResult(
             final_state=state,
@@ -277,4 +305,5 @@ class TaskPlanRunner:
             terminal_status=state.task_status,
             safe_message=message,
             error_code=error_code,
+            approval_request=state.approval_request,
         )

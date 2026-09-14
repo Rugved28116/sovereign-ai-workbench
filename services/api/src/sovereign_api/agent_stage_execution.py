@@ -35,6 +35,11 @@ from sovereign_api.tool_execution import (
     ToolExecutor, ToolApprovalRequiredError, ToolPermissionDeniedError,
     ToolExecutionError,
 )
+from sovereign_api.tool_approval import (
+    ApprovalChoice, ApprovalDecision, ApprovalRequest,
+    ValidatedApprovalAuthorization, _issue_validated_authorization,
+    request_fingerprint,
+)
 from sovereign_api.workspace_read_file import (
     WORKSPACE_READ_FILE_TOOL_ID, WORKSPACE_READ_OPERATION,
 )
@@ -73,12 +78,13 @@ class StageExecutionResult:
     execution_kind: StageExecutionKind = StageExecutionKind.MODEL
     selected_tool_id: str | None = None
     output_reference: str | None = None
+    approval_request: ApprovalRequest | None = None
 
     def __post_init__(self) -> None:
         if type(self.stage_id) is not str or not self.stage_id.strip():
             raise InvalidStageExecutionResultError("Stage result ID is invalid")
         if type(self.status) is not StageStatus or self.status not in (
-            StageStatus.COMPLETED, StageStatus.FAILED,
+            StageStatus.COMPLETED, StageStatus.FAILED, StageStatus.AWAITING_APPROVAL,
         ):
             raise InvalidStageExecutionResultError("Stage result status is invalid")
         for value in (self.safe_message, self.error_code):
@@ -103,6 +109,8 @@ class StageExecutionResult:
         if type(self.model_invocations) is not int or self.model_invocations not in (0, 1):
             raise InvalidStageExecutionResultError("Model invocation count is invalid")
         if self.status is StageStatus.COMPLETED:
+            if self.approval_request is not None:
+                raise InvalidStageExecutionResultError("Completed stage cannot request approval")
             if (
                 self.error_code is not None
                 or (self.text_content is None) == (self.output_reference is None)
@@ -124,9 +132,20 @@ class StageExecutionResult:
                 raise InvalidStageExecutionResultError("Stage result is not UTF-8") from None
             if encoded_size > MAX_STAGE_OUTPUT_BYTES:
                 raise InvalidStageExecutionResultError("Stage result exceeds the size limit")
+        elif self.status is StageStatus.AWAITING_APPROVAL:
+            if (
+                self.execution_kind is not StageExecutionKind.TOOL
+                or type(self.approval_request) is not ApprovalRequest
+                or self.approval_request.stage_id != self.stage_id
+                or self.approval_request.tool_id != self.selected_tool_id
+                or self.text_content is not None or self.output_reference is not None
+                or self.error_code is not None or self.safe_message is not None
+            ):
+                raise InvalidStageExecutionResultError("Approval result is invalid")
         elif (
             self.text_content is not None or self.output_reference is not None
             or self.error_code is None or self.safe_message is None
+            or self.approval_request is not None
         ):
             raise InvalidStageExecutionResultError("Failed stage result is invalid")
 
@@ -154,6 +173,7 @@ class StageCoordinationReport:
 
     state: AgentTaskState
     model_invocations: int
+    approval_request: ApprovalRequest | None = None
 
 
 class StageExecutor(Protocol):
@@ -267,7 +287,17 @@ class ToolBackedStageExecutor:
         self._permissions = granted_permissions
         self._environment = environment
 
-    async def execute(self, task: AgentTaskState, stage: TaskStage) -> StageExecutionResult:
+    def describe(self, tool_id: str):
+        return self._executor.describe(tool_id)
+
+    async def execute(
+        self, task: AgentTaskState, stage: TaskStage, *,
+        approval_created_at: datetime | None = None,
+        approved_request: ApprovalRequest | None = None,
+        validated_authorization: ValidatedApprovalAuthorization | None = None,
+        granted_permissions: frozenset[ToolPermission] | None = None,
+        environment: DeploymentEnvironment | None = None,
+    ) -> StageExecutionResult:
         operation = self._OPERATIONS.get(stage.tool_id)
         if operation is None:
             return StageExecutionResult.failed(
@@ -283,17 +313,59 @@ class ToolBackedStageExecutor:
                 execution_kind=StageExecutionKind.TOOL, selected_tool_id=stage.tool_id,
             )
         request = ToolRequest(
-            request_id=uuid4().hex, tool_id=stage.tool_id,
+            request_id=approved_request.request_id if approved_request is not None else uuid4().hex,
+            tool_id=stage.tool_id,
             operation=operation, arguments=stage.tool_arguments,
             task_id=task.task_id, stage_id=stage.stage_id,
         )
         try:
-            result = await self._executor.execute(
-                request, granted_permissions=self._permissions,
-                environment=self._environment,
-            )
+            effective_grants = self._permissions if granted_permissions is None else granted_permissions
+            effective_environment = self._environment if environment is None else environment
+            if approved_request is None:
+                result = await self._executor.execute(
+                    request, granted_permissions=effective_grants,
+                    environment=effective_environment,
+                )
+            elif validated_authorization is not None:
+                result = await self._executor.execute(
+                    request, granted_permissions=effective_grants,
+                    environment=effective_environment,
+                    approval_authorization=validated_authorization,
+                )
+            else:
+                raise ToolPermissionDeniedError("Tool approval is invalid")
         except ToolApprovalRequiredError:
-            code = "tool_approval_required"
+            if approved_request is not None or approval_created_at is None:
+                code = "tool_approval_required"
+            else:
+                try:
+                    descriptor = self.describe(stage.tool_id)
+                    approval = ApprovalRequest(
+                        approval_id=uuid4().hex,
+                        request_id=request.request_id,
+                        task_id=task.task_id,
+                        stage_id=stage.stage_id,
+                        tool_id=stage.tool_id,
+                        operation=operation,
+                        requested_permissions=descriptor.required_permissions,
+                        risk_level=descriptor.risk_level,
+                        side_effect_level=descriptor.side_effect_level,
+                        created_at=approval_created_at,
+                        safe_summary="Tool execution requires approval",
+                        request_fingerprint=request_fingerprint(
+                            request, descriptor.required_permissions,
+                        ),
+                    )
+                except Exception:
+                    code = "tool_unexpected_failure"
+                else:
+                    return StageExecutionResult(
+                        stage_id=stage.stage_id,
+                        status=StageStatus.AWAITING_APPROVAL,
+                        execution_kind=StageExecutionKind.TOOL,
+                        selected_tool_id=stage.tool_id,
+                        approval_request=approval,
+                    )
         except ToolPermissionDeniedError:
             code = "tool_denied"
         except (SafeToolError, ToolExecutionError):
@@ -407,21 +479,142 @@ class StageExecutionCoordinator:
     async def execute_one_with_report(
         self, task: AgentTaskState, stage: TaskStage,
     ) -> StageCoordinationReport:
+        return await self._advance(task, stage)
+
+    def _approval_matches(self, task: AgentTaskState, stage: TaskStage,
+                          approval: ApprovalRequest) -> bool:
+        if self._tool_executor is None or type(approval) is not ApprovalRequest:
+            return False
+        try:
+            checked = ApprovalRequest(
+                approval_id=approval.approval_id,
+                request_id=approval.request_id,
+                task_id=approval.task_id,
+                stage_id=approval.stage_id,
+                tool_id=approval.tool_id,
+                operation=approval.operation,
+                requested_permissions=approval.requested_permissions,
+                risk_level=approval.risk_level,
+                side_effect_level=approval.side_effect_level,
+                created_at=approval.created_at,
+                safe_summary=approval.safe_summary,
+                request_fingerprint=approval.request_fingerprint,
+            )
+            if checked != approval:
+                return False
+            descriptor = self._tool_executor.describe(stage.tool_id)
+            request = ToolRequest(
+                request_id=approval.request_id, task_id=task.task_id,
+                stage_id=stage.stage_id, tool_id=stage.tool_id,
+                operation=self._tool_executor._OPERATIONS[stage.tool_id],
+                arguments=stage.tool_arguments,
+            )
+            return (
+                approval.task_id == task.task_id
+                and approval.stage_id == stage.stage_id
+                and approval.tool_id == stage.tool_id
+                and approval.operation == request.operation
+                and approval.requested_permissions == descriptor.required_permissions
+                and approval.risk_level is descriptor.risk_level
+                and approval.side_effect_level is descriptor.side_effect_level
+                and approval.request_fingerprint == request_fingerprint(
+                    request, descriptor.required_permissions,
+                )
+            )
+        except Exception:
+            return False
+
+    async def resume_approved_stage(
+        self, state: AgentTaskState, approval_request: ApprovalRequest,
+        decision: ApprovalDecision, *,
+        granted_permissions: frozenset[ToolPermission],
+        environment: DeploymentEnvironment,
+    ) -> StageCoordinationReport:
+        try:
+            if type(decision) is not ApprovalDecision:
+                raise ValueError
+            decision.__post_init__()
+        except Exception:
+            raise InvalidStageCoordinationError("Approval decision is invalid") from None
+        if (
+            type(state) is not AgentTaskState
+            or state.task_status is not TaskStatus.AWAITING_APPROVAL
+            or type(approval_request) is not ApprovalRequest
+            or type(decision) is not ApprovalDecision
+            or type(granted_permissions) is not frozenset
+            or type(environment) is not DeploymentEnvironment
+            or approval_request != state.approval_request
+            or decision.approval_id != approval_request.approval_id
+            or decision.decided_at < approval_request.created_at
+        ):
+            raise InvalidStageCoordinationError("Approval is invalid or stale")
+        stage = next((item for item in state.plan.stages
+                      if item.stage_id == state.current_stage_id), None)
+        if stage is None or not self._approval_matches(state, stage, approval_request):
+            raise InvalidStageCoordinationError("Approval does not match blocked stage")
+        if decision.decision is ApprovalChoice.REJECT:
+            failed_at = self._timestamp_after(state.updated_at)
+            active = next(item for item in state.stage_states
+                          if item.stage_id == state.current_stage_id)
+            rejected = state.update_stage(
+                active.fail(error_code="approval_rejected",
+                            safe_message="Tool approval was rejected"),
+                updated_at=failed_at,
+            )
+            return StageCoordinationReport(rejected, 0)
+        if decision.decision is not ApprovalChoice.APPROVE:
+            raise InvalidStageCoordinationError("Approval decision is invalid")
+        try:
+            descriptor = self._tool_executor.describe(stage.tool_id)
+            request = ToolRequest(
+                request_id=approval_request.request_id,
+                task_id=state.task_id, stage_id=stage.stage_id,
+                tool_id=stage.tool_id,
+                operation=self._tool_executor._OPERATIONS[stage.tool_id],
+                arguments=stage.tool_arguments,
+            )
+            authorization = _issue_validated_authorization(
+                state, stage, approval_request, decision, request,
+                descriptor.required_permissions,
+            )
+        except Exception:
+            raise InvalidStageCoordinationError("Approval does not match blocked stage") from None
+        return await self._advance(
+            state, stage, approved_request=approval_request,
+            validated_authorization=authorization,
+            granted_permissions=granted_permissions, environment=environment,
+        )
+
+    async def _advance(
+        self, task: AgentTaskState, stage: TaskStage, *,
+        approved_request: ApprovalRequest | None = None,
+        validated_authorization: ValidatedApprovalAuthorization | None = None,
+        granted_permissions: frozenset[ToolPermission] | None = None,
+        environment: DeploymentEnvironment | None = None,
+    ) -> StageCoordinationReport:
         if type(task) is not AgentTaskState or type(stage) is not TaskStage:
             raise InvalidStageCoordinationError("Task or stage is invalid")
-        if task.task_status not in (TaskStatus.PENDING, TaskStatus.RUNNING):
+        resuming = approved_request is not None
+        if resuming:
+            if task.task_status is not TaskStatus.AWAITING_APPROVAL:
+                raise InvalidStageCoordinationError("Task is not awaiting approval")
+        elif task.task_status not in (TaskStatus.PENDING, TaskStatus.RUNNING):
             raise InvalidStageCoordinationError("Terminal task cannot execute a stage")
-        if task.current_stage_id is not None:
+        if task.current_stage_id is not None and not resuming:
             raise InvalidStageCoordinationError("A stage is already running")
-        next_index = next(
-            (index for index, item in enumerate(task.stage_states)
-             if item.status is StageStatus.PENDING), None,
+        next_index = (
+            next((index for index, item in enumerate(task.stage_states)
+                  if item.stage_id == task.current_stage_id), None)
+            if resuming else next((index for index, item in enumerate(task.stage_states)
+                                   if item.status is StageStatus.PENDING), None)
         )
         if next_index is None or any(
             item.status is not StageStatus.COMPLETED
             for item in task.stage_states[:next_index]
         ):
             raise InvalidStageCoordinationError("Stage is not the next planned stage")
+        if resuming and task.stage_states[next_index].status is not StageStatus.AWAITING_APPROVAL:
+            raise InvalidStageCoordinationError("Stage is not awaiting approval")
         expected = task.plan.stages[next_index]
         if (
             stage.stage_id != expected.stage_id
@@ -477,7 +670,8 @@ class StageExecutionCoordinator:
         if current.task_status is TaskStatus.PENDING:
             current = current.start(updated_at=next(transition_times))
         current = current.update_stage(
-            current.stage_states[next_index].start(),
+            (current.stage_states[next_index].resume_approval() if resuming
+             else current.stage_states[next_index].start()),
             updated_at=next(transition_times),
         )
         terminal_at = next(transition_times)
@@ -493,7 +687,13 @@ class StageExecutionCoordinator:
                         execution_kind=StageExecutionKind.TOOL, selected_tool_id=stage.tool_id,
                     )
                 else:
-                    result = await self._tool_executor.execute(current, stage)
+                    result = await self._tool_executor.execute(
+                        current, stage, approval_created_at=terminal_at,
+                        approved_request=approved_request,
+                        validated_authorization=validated_authorization,
+                        granted_permissions=granted_permissions,
+                        environment=environment,
+                    )
             else:
                 result = await self._executor.execute(current, stage, prompt)
         except Exception:
@@ -518,6 +718,20 @@ class StageExecutionCoordinator:
             )
 
         active = current.stage_states[next_index]
+        if result.status is StageStatus.AWAITING_APPROVAL:
+            if resuming or not self._approval_matches(current, stage, result.approval_request):
+                result = StageExecutionResult.failed(
+                    stage.stage_id, error_code="stage_invalid_result",
+                    execution_kind=stage.execution_kind,
+                    selected_tool_id=stage.tool_id,
+                )
+            else:
+                current = current.update_stage(
+                    active.await_approval(selected_tool_id=stage.tool_id),
+                    updated_at=terminal_at,
+                    approval_request=result.approval_request,
+                )
+                return StageCoordinationReport(current, 0, result.approval_request)
         if result.status is StageStatus.COMPLETED:
             if result.output_reference is not None:
                 current = current.update_stage(

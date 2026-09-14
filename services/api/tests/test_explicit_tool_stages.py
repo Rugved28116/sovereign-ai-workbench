@@ -191,8 +191,9 @@ def test_denial_and_approval_stop_without_tool_or_provider_execution(tmp_path):
         tmp_path / "other", stages, grants=frozenset({WRITE}), policy=ApprovalPolicy(),
     )
     approval = run(coordinator.execute_one(task, stages[0]))
-    assert approval.task_status is TaskStatus.FAILED
-    assert approval.stage_states[0].error_code == "tool_approval_required"
+    assert approval.task_status is TaskStatus.AWAITING_APPROVAL
+    assert approval.stage_states[0].status is StageStatus.AWAITING_APPROVAL
+    assert approval.approval_request is not None
     assert not (artifact / "output.txt").exists()
     assert len(provider.requests) == 0
 

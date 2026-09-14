@@ -19,6 +19,10 @@ from sovereign_api.tool_contracts import (
     UnknownToolError,
 )
 from sovereign_api.tool_policy import ToolPermissionDecision, ToolPolicyEvaluator
+from sovereign_api.tool_approval import (
+    ValidatedApprovalAuthorization, _is_validated_authorization,
+    request_fingerprint,
+)
 
 
 class ToolExecutionError(SovereignAPIError):
@@ -93,12 +97,15 @@ class ExecutableToolRegistry:
 
 
 class ToolExecutor(Protocol):
+    def describe(self, tool_id: str) -> ToolDescriptor: ...
+
     async def execute(
         self,
         request: ToolRequest,
         *,
         granted_permissions: frozenset[ToolPermission],
         environment: DeploymentEnvironment,
+        approval_authorization: ValidatedApprovalAuthorization | None = None,
     ) -> ToolResult: ...
 
 
@@ -140,12 +147,16 @@ class PolicyEnforcedToolExecutor:
                 )
         object.__setattr__(self, "tools", implementations)
 
+    def describe(self, tool_id: str) -> ToolDescriptor:
+        return self.registry.get(tool_id)
+
     async def execute(
         self,
         request: ToolRequest,
         *,
         granted_permissions: frozenset[ToolPermission],
         environment: DeploymentEnvironment,
+        approval_authorization: ValidatedApprovalAuthorization | None = None,
     ) -> ToolResult:
         descriptor = self.registry.get(request.tool_id)
         try:
@@ -156,10 +167,32 @@ class PolicyEnforcedToolExecutor:
             )
         except Exception:
             raise ToolPermissionDeniedError("Tool execution denied") from None
-        if decision is ToolPermissionDecision.REQUIRE_APPROVAL:
-            raise ToolApprovalRequiredError("Tool execution requires approval")
-        if decision is not ToolPermissionDecision.ALLOW:
+        if decision is ToolPermissionDecision.DENY or decision not in (
+            ToolPermissionDecision.ALLOW, ToolPermissionDecision.REQUIRE_APPROVAL,
+        ):
             raise ToolPermissionDeniedError("Tool execution denied")
+        if approval_authorization is not None:
+            if (
+                not _is_validated_authorization(approval_authorization)
+                or approval_authorization.task_id != request.task_id
+                or approval_authorization.stage_id != request.stage_id
+                or approval_authorization.tool_id != request.tool_id
+                or type(granted_permissions) is not frozenset
+                or not frozenset(descriptor.required_permissions) <= granted_permissions
+                or type(environment) is not DeploymentEnvironment
+                or (descriptor.requires_network and (
+                    environment is DeploymentEnvironment.AIR_GAPPED
+                    or ToolPermission("network.access") not in granted_permissions
+                ))
+                or approval_authorization.request_fingerprint
+                != request_fingerprint(request, descriptor.required_permissions)
+            ):
+                raise ToolPermissionDeniedError("Tool approval does not match request")
+        if (
+            decision is ToolPermissionDecision.REQUIRE_APPROVAL
+            and approval_authorization is None
+        ):
+            raise ToolApprovalRequiredError("Tool execution requires approval")
 
         registration = self.tools.get(descriptor.tool_id)
         if registration.tool_id != descriptor.tool_id or request.tool_id != descriptor.tool_id:
