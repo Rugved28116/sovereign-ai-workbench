@@ -8,8 +8,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Protocol
+from uuid import uuid4
 
-from sovereign_api.agent_task_state import AgentTaskState, StageStatus, TaskStatus
+from sovereign_api.agent_task_state import (
+    AgentTaskState, StageOutputKind, StageStatus, TaskStatus,
+)
+from sovereign_api.artifact_reference import valid_artifact_reference
+from sovereign_api.config import DeploymentEnvironment
 from sovereign_api.contracts import ModelRequest, ModelResponse
 from sovereign_api.errors import (
     InvalidExecutionStateError, OrchestrationError, ProviderError, RoutingError,
@@ -22,7 +27,20 @@ from sovereign_api.stage_output_store import (
     MAX_STAGE_OUTPUT_BYTES, StageOutput, StageOutputReference,
     StageOutputStore, StageOutputStoreError, StageOutputNotFoundError,
 )
-from sovereign_api.task_planning import TaskStage, TaskStageType
+from sovereign_api.task_planning import StageExecutionKind, TaskStage, TaskStageType
+from sovereign_api.tool_contracts import (
+    SafeToolError, ToolPermission, ToolRequest, ToolResult, ToolResultStatus,
+)
+from sovereign_api.tool_execution import (
+    ToolExecutor, ToolApprovalRequiredError, ToolPermissionDeniedError,
+    ToolExecutionError,
+)
+from sovereign_api.workspace_read_file import (
+    WORKSPACE_READ_FILE_TOOL_ID, WORKSPACE_READ_OPERATION,
+)
+from sovereign_api.workspace_write_artifact import (
+    WORKSPACE_WRITE_ARTIFACT_TOOL_ID, WORKSPACE_WRITE_OPERATION,
+)
 
 
 _SAFE_FAILURE = "Stage execution failed"
@@ -52,6 +70,9 @@ class StageExecutionResult:
     safe_message: str | None = None
     error_code: str | None = None
     model_invocations: int = 0
+    execution_kind: StageExecutionKind = StageExecutionKind.MODEL
+    selected_tool_id: str | None = None
+    output_reference: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.stage_id) is not str or not self.stage_id.strip():
@@ -68,20 +89,45 @@ class StageExecutionResult:
                 raise InvalidStageExecutionResultError("Stage result field is invalid")
         if self.selected_model_id is not None and not valid_model_id(self.selected_model_id):
             raise InvalidStageExecutionResultError("Selected model ID is invalid")
+        if type(self.execution_kind) is not StageExecutionKind:
+            raise InvalidStageExecutionResultError("Stage result kind is invalid")
+        if self.execution_kind is StageExecutionKind.MODEL:
+            if self.selected_tool_id is not None or self.output_reference is not None:
+                raise InvalidStageExecutionResultError("Model result has tool fields")
+        elif self.selected_model_id is not None or self.model_invocations != 0:
+            raise InvalidStageExecutionResultError("Tool result has model fields")
+        if self.selected_tool_id is not None and (
+            type(self.selected_tool_id) is not str or not self.selected_tool_id.strip()
+        ):
+            raise InvalidStageExecutionResultError("Selected tool ID is invalid")
         if type(self.model_invocations) is not int or self.model_invocations not in (0, 1):
             raise InvalidStageExecutionResultError("Model invocation count is invalid")
         if self.status is StageStatus.COMPLETED:
-            if type(self.text_content) is not str or self.error_code is not None:
+            if (
+                self.error_code is not None
+                or (self.text_content is None) == (self.output_reference is None)
+                or (self.text_content is not None and type(self.text_content) is not str)
+            ):
                 raise InvalidStageExecutionResultError("Completed stage result is invalid")
-            if len(self.text_content) > MAX_STAGE_OUTPUT_BYTES:
+            if self.execution_kind is StageExecutionKind.MODEL and self.text_content is None:
+                raise InvalidStageExecutionResultError("Model stage must return text")
+            if self.output_reference is not None and not valid_artifact_reference(self.output_reference):
+                raise InvalidStageExecutionResultError("Artifact reference is invalid")
+            if self.text_content is not None and len(self.text_content) > MAX_STAGE_OUTPUT_BYTES:
                 raise InvalidStageExecutionResultError("Stage result exceeds the size limit")
             try:
-                encoded_size = len(self.text_content.encode("utf-8", errors="strict"))
+                encoded_size = (
+                    len(self.text_content.encode("utf-8", errors="strict"))
+                    if self.text_content is not None else 0
+                )
             except UnicodeEncodeError:
                 raise InvalidStageExecutionResultError("Stage result is not UTF-8") from None
             if encoded_size > MAX_STAGE_OUTPUT_BYTES:
                 raise InvalidStageExecutionResultError("Stage result exceeds the size limit")
-        elif self.text_content is not None or self.error_code is None or self.safe_message is None:
+        elif (
+            self.text_content is not None or self.output_reference is not None
+            or self.error_code is None or self.safe_message is None
+        ):
             raise InvalidStageExecutionResultError("Failed stage result is invalid")
 
     @classmethod
@@ -89,12 +135,16 @@ class StageExecutionResult:
         cls, stage_id: str, *, error_code: str,
         selected_model_id: str | None = None,
         model_invocations: int = 0,
+        execution_kind: StageExecutionKind = StageExecutionKind.MODEL,
+        selected_tool_id: str | None = None,
     ) -> StageExecutionResult:
         return cls(
             stage_id=stage_id, status=StageStatus.FAILED,
             selected_model_id=selected_model_id,
             safe_message=_SAFE_FAILURE, error_code=error_code,
             model_invocations=model_invocations,
+            execution_kind=execution_kind,
+            selected_tool_id=selected_tool_id,
         )
 
 
@@ -191,6 +241,106 @@ class RoutedAgentStageExecutor:
         )
 
 
+def _fits_stage_output(text: str) -> bool:
+    if type(text) is not str or len(text) > MAX_STAGE_OUTPUT_BYTES:
+        return False
+    try:
+        return len(text.encode("utf-8", errors="strict")) <= MAX_STAGE_OUTPUT_BYTES
+    except UnicodeEncodeError:
+        return False
+
+
+class ToolBackedStageExecutor:
+    """Execute only trusted, explicit local tool stages through ToolExecutor."""
+
+    _OPERATIONS = MappingProxyType({
+        WORKSPACE_READ_FILE_TOOL_ID: WORKSPACE_READ_OPERATION,
+        WORKSPACE_WRITE_ARTIFACT_TOOL_ID: WORKSPACE_WRITE_OPERATION,
+    })
+
+    def __init__(
+        self, executor: ToolExecutor, *,
+        granted_permissions: frozenset[ToolPermission],
+        environment: DeploymentEnvironment,
+    ) -> None:
+        self._executor = executor
+        self._permissions = granted_permissions
+        self._environment = environment
+
+    async def execute(self, task: AgentTaskState, stage: TaskStage) -> StageExecutionResult:
+        operation = self._OPERATIONS.get(stage.tool_id)
+        if operation is None:
+            return StageExecutionResult.failed(
+                stage.stage_id, error_code="tool_unavailable",
+                execution_kind=StageExecutionKind.TOOL, selected_tool_id=stage.tool_id,
+            )
+        if (
+            stage.tool_id == WORKSPACE_WRITE_ARTIFACT_TOOL_ID
+            and not valid_artifact_reference(stage.tool_arguments.get("path"))
+        ):
+            return StageExecutionResult.failed(
+                stage.stage_id, error_code="tool_invalid_result",
+                execution_kind=StageExecutionKind.TOOL, selected_tool_id=stage.tool_id,
+            )
+        request = ToolRequest(
+            request_id=uuid4().hex, tool_id=stage.tool_id,
+            operation=operation, arguments=stage.tool_arguments,
+            task_id=task.task_id, stage_id=stage.stage_id,
+        )
+        try:
+            result = await self._executor.execute(
+                request, granted_permissions=self._permissions,
+                environment=self._environment,
+            )
+        except ToolApprovalRequiredError:
+            code = "tool_approval_required"
+        except ToolPermissionDeniedError:
+            code = "tool_denied"
+        except (SafeToolError, ToolExecutionError):
+            code = "tool_failed"
+        except Exception:
+            code = "tool_unexpected_failure"
+        else:
+            if (
+                type(result) is not ToolResult
+                or result.request_id != request.request_id
+                or result.tool_id != stage.tool_id
+            ):
+                code = "tool_invalid_result"
+            elif result.status is ToolResultStatus.FAILED:
+                code = "tool_failed"
+            elif result.status is ToolResultStatus.SUCCEEDED and (
+                (
+                    stage.tool_id == WORKSPACE_READ_FILE_TOOL_ID
+                    and result.text_content is not None
+                    and result.output_reference is None
+                )
+                or (
+                    stage.tool_id == WORKSPACE_WRITE_ARTIFACT_TOOL_ID
+                    and result.output_reference is not None
+                    and result.text_content is None
+                )
+            ):
+                if result.output_reference is not None and not valid_artifact_reference(result.output_reference):
+                    code = "tool_invalid_result"
+                elif result.text_content is not None and not _fits_stage_output(result.text_content):
+                    code = "tool_output_too_large"
+                else:
+                    return StageExecutionResult(
+                        stage_id=stage.stage_id, status=StageStatus.COMPLETED,
+                        execution_kind=StageExecutionKind.TOOL,
+                        selected_tool_id=stage.tool_id,
+                        text_content=result.text_content,
+                        output_reference=result.output_reference,
+                    )
+            else:
+                code = "tool_invalid_result"
+        return StageExecutionResult.failed(
+            stage.stage_id, error_code=code,
+            execution_kind=StageExecutionKind.TOOL, selected_tool_id=stage.tool_id,
+        )
+
+
 def build_chained_stage_prompt(
     task: AgentTaskState, stage: TaskStage, previous_output: StageOutput | None,
 ) -> str:
@@ -222,10 +372,20 @@ class StageExecutionCoordinator:
         self, executor: StageExecutor,
         *, output_store: StageOutputStore,
         clock: Callable[[], datetime] | None = None,
+        tool_executor: ToolExecutor | None = None,
+        granted_tool_permissions: frozenset[ToolPermission] = frozenset(),
+        tool_environment: DeploymentEnvironment | None = None,
     ) -> None:
         self._executor = executor
         self._output_store = output_store
         self._clock = clock if clock is not None else lambda: datetime.now(UTC)
+        self._tool_executor = (
+            ToolBackedStageExecutor(
+                tool_executor, granted_permissions=granted_tool_permissions,
+                environment=tool_environment,
+            ) if tool_executor is not None and type(tool_environment) is DeploymentEnvironment
+            else None
+        )
 
     def _timestamp_after(self, previous: datetime) -> datetime:
         try:
@@ -267,13 +427,19 @@ class StageExecutionCoordinator:
             stage.stage_id != expected.stage_id
             or stage.stage_type is not expected.stage_type
             or stage.required_capabilities != expected.required_capabilities
+            or stage.execution_kind is not expected.execution_kind
+            or stage.tool_id != expected.tool_id
+            or stage.tool_arguments != expected.tool_arguments
         ):
             raise InvalidStageCoordinationError("Stage is not the next planned stage")
 
         previous_output = None
-        if next_index > 0:
+        if next_index > 0 and stage.execution_kind is StageExecutionKind.MODEL:
             previous_stage = task.stage_states[next_index - 1]
-            if previous_stage.output_reference is None:
+            if (
+                previous_stage.output_reference is None
+                or previous_stage.output_kind is StageOutputKind.ARTIFACT
+            ):
                 raise StageOutputNotFoundError("Previous stage output is unavailable")
             try:
                 previous_output = self._output_store.get(
@@ -320,18 +486,51 @@ class StageExecutionCoordinator:
         )
 
         try:
-            result = await self._executor.execute(current, stage, prompt)
+            if stage.execution_kind is StageExecutionKind.TOOL:
+                if self._tool_executor is None:
+                    result = StageExecutionResult.failed(
+                        stage.stage_id, error_code="tool_unavailable",
+                        execution_kind=StageExecutionKind.TOOL, selected_tool_id=stage.tool_id,
+                    )
+                else:
+                    result = await self._tool_executor.execute(current, stage)
+            else:
+                result = await self._executor.execute(current, stage, prompt)
         except Exception:
             result = StageExecutionResult.failed(
                 stage.stage_id, error_code="stage_unexpected_failure",
+                execution_kind=stage.execution_kind,
+                selected_tool_id=stage.tool_id if stage.execution_kind is StageExecutionKind.TOOL else None,
             )
-        if type(result) is not StageExecutionResult or result.stage_id != stage.stage_id:
+        if (
+            type(result) is not StageExecutionResult
+            or result.stage_id != stage.stage_id
+            or result.execution_kind is not stage.execution_kind
+            or (
+                stage.execution_kind is StageExecutionKind.TOOL
+                and result.selected_tool_id != stage.tool_id
+            )
+        ):
             result = StageExecutionResult.failed(
                 stage.stage_id, error_code="stage_invalid_result",
+                execution_kind=stage.execution_kind,
+                selected_tool_id=stage.tool_id if stage.execution_kind is StageExecutionKind.TOOL else None,
             )
 
         active = current.stage_states[next_index]
         if result.status is StageStatus.COMPLETED:
+            if result.output_reference is not None:
+                current = current.update_stage(
+                    active.complete(
+                        output_reference=result.output_reference,
+                        selected_tool_id=result.selected_tool_id,
+                        output_kind=StageOutputKind.ARTIFACT,
+                    ), updated_at=terminal_at,
+                )
+                if all(item.status is StageStatus.COMPLETED for item in current.stage_states):
+                    assert task_complete_at is not None
+                    current = current.complete(updated_at=task_complete_at)
+                return StageCoordinationReport(current, 0)
             try:
                 output = StageOutput(
                     task_id=task.task_id, stage_id=stage.stage_id,
@@ -349,12 +548,16 @@ class StageExecutionCoordinator:
                     stage.stage_id, error_code="output_store_failed",
                     selected_model_id=result.selected_model_id,
                     model_invocations=result.model_invocations,
+                    execution_kind=result.execution_kind,
+                    selected_tool_id=result.selected_tool_id,
                 )
             else:
                 current = current.update_stage(
                     active.complete(
                         output_reference=reference.value,
                         selected_model_id=result.selected_model_id,
+                        selected_tool_id=result.selected_tool_id,
+                        output_kind=StageOutputKind.TEXT,
                     ),
                     updated_at=terminal_at,
                 )
@@ -372,6 +575,9 @@ class StageExecutionCoordinator:
                     "provider_response_invalid", "unsupported_stage",
                     "stage_unexpected_failure", "stage_invalid_result",
                     "output_store_failed",
+                    "tool_unavailable", "tool_denied", "tool_approval_required",
+                    "tool_failed", "tool_unexpected_failure", "tool_invalid_result",
+                    "tool_output_too_large",
                 }
                 else "stage_execution_failed"
             )
@@ -383,6 +589,7 @@ class StageExecutionCoordinator:
                         else _SAFE_FAILURE
                     ),
                     selected_model_id=result.selected_model_id,
+                    selected_tool_id=result.selected_tool_id,
                 ),
                 updated_at=terminal_at,
             )

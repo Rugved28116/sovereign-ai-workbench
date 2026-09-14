@@ -14,9 +14,10 @@ from sovereign_api.errors import (
     InvalidTaskTransitionError,
 )
 from sovereign_api.prompt_validation import Prompt
+from sovereign_api.artifact_reference import valid_artifact_reference
 from sovereign_api.registry.models import valid_model_id
 from sovereign_api.task_classification import TaskClass
-from sovereign_api.task_planning import TaskPlan, TaskStageType
+from sovereign_api.task_planning import StageExecutionKind, TaskPlan, TaskStageType
 
 _PROMPT_VALIDATOR = TypeAdapter(Prompt)
 _UTC_OFFSET = timedelta(0)
@@ -39,6 +40,11 @@ class StageStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+class StageOutputKind(StrEnum):
+    TEXT = "text"
+    ARTIFACT = "artifact"
+
+
 @dataclass(frozen=True, slots=True)
 class StageExecutionState:
     """Immutable lifecycle state for one logical plan stage."""
@@ -51,6 +57,9 @@ class StageExecutionState:
     output_reference: str | None = None
     error_code: str | None = None
     safe_message: str | None = None
+    execution_kind: StageExecutionKind = StageExecutionKind.MODEL
+    selected_tool_id: str | None = None
+    output_kind: StageOutputKind | None = None
 
     def __post_init__(self) -> None:
         capabilities = tuple(self.required_capabilities)
@@ -60,17 +69,31 @@ class StageExecutionState:
             raise InvalidExecutionStateError("stage_id must be a non-empty string")
         if type(self.stage_type) is not TaskStageType:
             raise InvalidExecutionStateError("stage_type must be a TaskStageType")
-        if not capabilities or any(
+        if any(
             type(capability) is not str or not capability
             for capability in capabilities
-        ):
+        ) or (self.execution_kind is StageExecutionKind.MODEL and not capabilities):
             raise InvalidExecutionStateError(
                 "stage capabilities must be non-empty strings"
             )
         if type(self.status) is not StageStatus:
             raise InvalidExecutionStateError("status must be a StageStatus")
+        if type(self.execution_kind) is not StageExecutionKind:
+            raise InvalidExecutionStateError("stage execution kind is invalid")
+        if self.execution_kind is StageExecutionKind.TOOL:
+            if self.stage_type is not TaskStageType.TOOL or capabilities or self.selected_model_id is not None:
+                raise InvalidExecutionStateError("tool stage identity is invalid")
+        elif self.stage_type is TaskStageType.TOOL or self.selected_tool_id is not None:
+            raise InvalidExecutionStateError("model stage identity is invalid")
+        if self.output_kind is not None and type(self.output_kind) is not StageOutputKind:
+            raise InvalidExecutionStateError("stage output kind is invalid")
+        if self.execution_kind is StageExecutionKind.MODEL and self.output_kind is StageOutputKind.ARTIFACT:
+            raise InvalidExecutionStateError("model stage cannot contain an artifact reference")
+        if self.output_kind is StageOutputKind.ARTIFACT and not valid_artifact_reference(self.output_reference):
+            raise InvalidExecutionStateError("artifact reference is invalid")
         for name, value in (
             ("selected_model_id", self.selected_model_id),
+            ("selected_tool_id", self.selected_tool_id),
             ("output_reference", self.output_reference),
             ("error_code", self.error_code),
             ("safe_message", self.safe_message),
@@ -89,6 +112,8 @@ class StageExecutionState:
                 raise InvalidExecutionStateError(
                     "a completed stage requires an output reference"
                 )
+            if self.execution_kind is StageExecutionKind.TOOL and self.selected_tool_id is None:
+                raise InvalidExecutionStateError("a completed tool stage requires tool identity")
             if self.error_code is not None or self.safe_message is not None:
                 raise InvalidExecutionStateError(
                     "a completed stage cannot contain failure information"
@@ -98,12 +123,12 @@ class StageExecutionState:
                 raise InvalidExecutionStateError(
                     "a failed stage requires an error code and safe message"
                 )
-            if self.output_reference is not None:
+            if self.output_reference is not None or self.output_kind is not None:
                 raise InvalidExecutionStateError(
                     "a failed stage cannot contain an output reference"
                 )
         elif (
-            self.output_reference is not None
+            self.output_reference is not None or self.output_kind is not None
             or self.error_code is not None
             or self.safe_message is not None
         ):
@@ -111,40 +136,49 @@ class StageExecutionState:
                 "output and failure fields require their matching terminal state"
             )
         if self.status in (StageStatus.PENDING, StageStatus.SKIPPED) and (
-            self.selected_model_id is not None
+            self.selected_model_id is not None or self.selected_tool_id is not None
         ):
             raise InvalidExecutionStateError(
                 "pending and skipped stages cannot contain a selected model"
             )
 
-    def start(self, *, selected_model_id: str | None = None) -> StageExecutionState:
+    def start(self, *, selected_model_id: str | None = None, selected_tool_id: str | None = None) -> StageExecutionState:
         self._require_status(StageStatus.PENDING, StageStatus.RUNNING)
         return replace(
             self,
             status=StageStatus.RUNNING,
             selected_model_id=selected_model_id,
+            selected_tool_id=selected_tool_id,
         )
 
     def complete(
-        self, *, output_reference: str, selected_model_id: str | None = None
+        self, *, output_reference: str, selected_model_id: str | None = None,
+        selected_tool_id: str | None = None, output_kind: StageOutputKind = StageOutputKind.TEXT,
     ) -> StageExecutionState:
         self._require_status(StageStatus.RUNNING, StageStatus.COMPLETED)
         self._require_same_selected_model(selected_model_id)
+        self._require_same_selected_tool(selected_tool_id)
         return replace(
             self,
             status=StageStatus.COMPLETED,
             output_reference=output_reference,
+            output_kind=output_kind,
             selected_model_id=(
                 self.selected_model_id if selected_model_id is None else selected_model_id
+            ),
+            selected_tool_id=(
+                self.selected_tool_id if selected_tool_id is None else selected_tool_id
             ),
         )
 
     def fail(
         self, *, error_code: str, safe_message: str,
         selected_model_id: str | None = None,
+        selected_tool_id: str | None = None,
     ) -> StageExecutionState:
         self._require_status(StageStatus.RUNNING, StageStatus.FAILED)
         self._require_same_selected_model(selected_model_id)
+        self._require_same_selected_tool(selected_tool_id)
         return replace(
             self,
             status=StageStatus.FAILED,
@@ -152,6 +186,9 @@ class StageExecutionState:
             safe_message=safe_message,
             selected_model_id=(
                 self.selected_model_id if selected_model_id is None else selected_model_id
+            ),
+            selected_tool_id=(
+                self.selected_tool_id if selected_tool_id is None else selected_tool_id
             ),
         )
 
@@ -179,6 +216,10 @@ class StageExecutionState:
             and selected_model_id != self.selected_model_id
         ):
             raise InvalidStepTransitionError("selected model ID cannot change")
+
+    def _require_same_selected_tool(self, selected_tool_id: str | None) -> None:
+        if self.selected_tool_id is not None and selected_tool_id is not None and selected_tool_id != self.selected_tool_id:
+            raise InvalidStepTransitionError("selected tool ID cannot change")
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +287,7 @@ class AgentTaskState:
                 stage_id=stage.stage_id,
                 stage_type=stage.stage_type,
                 required_capabilities=stage.required_capabilities,
+                execution_kind=stage.execution_kind,
             )
             for stage in plan.stages
         )
@@ -375,6 +417,7 @@ class AgentTaskState:
         if (
             stage.stage_type is not current.stage_type
             or stage.required_capabilities != current.required_capabilities
+            or stage.execution_kind is not current.execution_kind
         ):
             raise InvalidExecutionStateError(
                 "stage updates cannot reinterpret plan requirements"
@@ -386,6 +429,8 @@ class AgentTaskState:
             raise InvalidExecutionStateError(
                 "stage updates cannot change an already selected model"
             )
+        if current.selected_tool_id is not None and stage.selected_tool_id != current.selected_tool_id:
+            raise InvalidExecutionStateError("stage updates cannot change an already selected tool")
         expected_stage = self._expected_stage_transition(current, stage)
         if stage != expected_stage:
             raise InvalidExecutionStateError(
@@ -417,13 +462,16 @@ class AgentTaskState:
         transition = (current.status, replacement.status)
         if transition == (StageStatus.PENDING, StageStatus.RUNNING):
             return current.start(
-                selected_model_id=replacement.selected_model_id
+                selected_model_id=replacement.selected_model_id,
+                selected_tool_id=replacement.selected_tool_id,
             )
         if transition == (StageStatus.RUNNING, StageStatus.COMPLETED):
             assert replacement.output_reference is not None
             return current.complete(
                 output_reference=replacement.output_reference,
                 selected_model_id=replacement.selected_model_id,
+                selected_tool_id=replacement.selected_tool_id,
+                output_kind=replacement.output_kind or StageOutputKind.TEXT,
             )
         if transition == (StageStatus.RUNNING, StageStatus.FAILED):
             assert replacement.error_code is not None
@@ -432,6 +480,7 @@ class AgentTaskState:
                 error_code=replacement.error_code,
                 safe_message=replacement.safe_message,
                 selected_model_id=replacement.selected_model_id,
+                selected_tool_id=replacement.selected_tool_id,
             )
         if transition == (StageStatus.RUNNING, StageStatus.CANCELLED):
             return current.cancel()
@@ -483,11 +532,11 @@ class AgentTaskState:
                 "task plans must contain unique stage IDs"
             )
         expected_stages = tuple(
-            (stage.stage_id, stage.stage_type, stage.required_capabilities)
+            (stage.stage_id, stage.stage_type, stage.required_capabilities, stage.execution_kind)
             for stage in self.plan.stages
         )
         actual_stages = tuple(
-            (stage.stage_id, stage.stage_type, stage.required_capabilities)
+            (stage.stage_id, stage.stage_type, stage.required_capabilities, stage.execution_kind)
             for stage in self.stage_states
         )
         expected_capabilities = tuple(
@@ -499,6 +548,10 @@ class AgentTaskState:
             self.task_class is not self.plan.task_class
             or expected_capabilities != self.required_capabilities
             or actual_stages != expected_stages
+            or any(
+                state.selected_tool_id is not None and state.selected_tool_id != plan_stage.tool_id
+                for state, plan_stage in zip(self.stage_states, self.plan.stages)
+            )
         ):
             raise InvalidExecutionStateError(
                 "task state must exactly preserve its plan projection"

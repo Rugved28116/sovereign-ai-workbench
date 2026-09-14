@@ -7,6 +7,7 @@ from typing import Final, Mapping, Protocol
 
 from sovereign_api.errors import UnsupportedTaskRequirementsError
 from sovereign_api.task_classification import TaskClass, TaskRequirements
+from sovereign_api.tool_contracts import FrozenJSON, freeze_tool_arguments
 
 
 class TaskStageType(StrEnum):
@@ -15,20 +16,47 @@ class TaskStageType(StrEnum):
     DOCUMENT = "document"
     VISION = "vision"
     REASON = "reason"
+    TOOL = "tool"
+
+
+class StageExecutionKind(StrEnum):
+    MODEL = "model"
+    TOOL = "tool"
 
 
 @dataclass(frozen=True, slots=True)
 class TaskStage:
-    """One immutable logical stage; it carries no execution assignment."""
+    """One immutable logical stage with no model/provider assignment."""
 
     stage_id: str
     stage_type: TaskStageType
     required_capabilities: tuple[str, ...]
+    execution_kind: StageExecutionKind = StageExecutionKind.MODEL
+    tool_id: str | None = None
+    tool_arguments: Mapping[str, FrozenJSON] | None = None
 
     def __post_init__(self) -> None:
+        if type(self.stage_id) is not str or not self.stage_id.strip():
+            raise UnsupportedTaskRequirementsError("Stage ID is invalid")
+        if type(self.stage_type) is not TaskStageType or type(self.execution_kind) is not StageExecutionKind:
+            raise UnsupportedTaskRequirementsError("Stage kind or type is invalid")
         object.__setattr__(
             self, "required_capabilities", tuple(self.required_capabilities)
         )
+        if self.execution_kind is StageExecutionKind.MODEL:
+            if (
+                self.stage_type is TaskStageType.TOOL or not self.required_capabilities
+                or self.tool_id is not None or self.tool_arguments is not None
+            ):
+                raise UnsupportedTaskRequirementsError("Model stage configuration is invalid")
+        else:
+            if (
+                self.stage_type is not TaskStageType.TOOL or self.required_capabilities
+                or type(self.tool_id) is not str or not self.tool_id.strip()
+                or self.tool_arguments is None
+            ):
+                raise UnsupportedTaskRequirementsError("Tool stage configuration is invalid")
+            object.__setattr__(self, "tool_arguments", freeze_tool_arguments(self.tool_arguments))
 
 
 @dataclass(frozen=True, slots=True)

@@ -287,6 +287,8 @@ def test_provider_failure_consumes_one_trusted_budget_unit():
 
 def test_stage_classification_is_trusted_and_unknown_types_fail_closed():
     for stage_type in TaskStageType:
+        if stage_type is TaskStageType.TOOL:
+            continue
         assert stage_requires_model_invocation(
             TaskStage("stage-1", stage_type, ("chat",))
         ) is True

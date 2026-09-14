@@ -377,7 +377,7 @@ def test_wrong_order_reexecution_forgery_and_terminal_task_make_zero_calls():
     forged = type(plan.stages[0])("stage-1", plan.stages[0].stage_type, ("chat",))
     with pytest.raises(InvalidStageCoordinationError):
         _run(coordinator, initial, forged)
-    wrong_type = TaskStage("stage-1", "document", ("document",))
+    wrong_type = TaskStage("stage-1", plan.stages[1].stage_type, ("document",))
     with pytest.raises(InvalidStageCoordinationError):
         _run(coordinator, initial, wrong_type)
     first = _run(coordinator, initial, plan.stages[0])

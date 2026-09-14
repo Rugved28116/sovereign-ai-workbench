@@ -56,12 +56,46 @@ class GenerateRequest(BaseModel):
         return self
 
 
+class PublicTaskStageResponse(BaseModel):
+    stage_id: str
+    stage_type: Literal["generate", "code", "document", "vision", "reason"]
+    required_capabilities: list[str]
+
+
+class PublicTaskPlanResponse(BaseModel):
+    task_class: TaskClass
+    stages: list[PublicTaskStageResponse]
+
+
 class RoutingInformation(BaseModel):
     environment: DeploymentEnvironment
     required_capabilities: list[str]
     capability_source: Literal["explicit", "inferred"] | None = None
     task_class: TaskClass | None = None
-    plan: TaskPlan | None = None
+    plan: PublicTaskPlanResponse | None = None
+
+    @field_validator("plan", mode="before")
+    @classmethod
+    def public_model_only_plan(
+        cls, plan: TaskPlan | PublicTaskPlanResponse | dict | None,
+    ) -> PublicTaskPlanResponse | dict | None:
+        if plan is None:
+            return None
+        if type(plan) in (PublicTaskPlanResponse, dict):
+            return plan
+        if type(plan) is not TaskPlan:
+            raise ValueError("Public plan is invalid")
+        return PublicTaskPlanResponse(
+            task_class=plan.task_class,
+            stages=[
+                PublicTaskStageResponse(
+                    stage_id=stage.stage_id,
+                    stage_type=stage.stage_type.value,
+                    required_capabilities=list(stage.required_capabilities),
+                )
+                for stage in plan.stages
+            ],
+        )
 
 
 class GenerateResponse(BaseModel):

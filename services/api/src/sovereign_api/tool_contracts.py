@@ -138,6 +138,13 @@ def _freeze_arguments(value: object, depth: int, budget: list[int]) -> FrozenJSO
     raise ToolValidationError("Tool arguments must contain only JSON values")
 
 
+def freeze_tool_arguments(value: object) -> Mapping[str, FrozenJSON]:
+    """Validate and copy the same bounded JSON object used by ToolRequest."""
+    if type(value) not in (dict, MappingProxyType):
+        raise ToolValidationError("Arguments must be a JSON object")
+    return _freeze_arguments(value, 0, [MAX_ARGUMENT_NODES])
+
+
 @dataclass(frozen=True, slots=True)
 class ToolRequest:
     request_id: str
@@ -152,11 +159,7 @@ class ToolRequest:
             self.request_id, self.tool_id, self.operation, self.task_id, self.stage_id
         ):
             _text(value)
-        if type(self.arguments) not in (dict, MappingProxyType):
-            raise ToolValidationError("Arguments must be a JSON object")
-        object.__setattr__(self, "arguments", _freeze_arguments(
-            self.arguments, 0, [MAX_ARGUMENT_NODES]
-        ))
+        object.__setattr__(self, "arguments", freeze_tool_arguments(self.arguments))
 
 
 class ToolResultStatus(StrEnum):

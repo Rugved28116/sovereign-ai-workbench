@@ -11,7 +11,7 @@ from sovereign_api.agent_task_state import (
     AgentTaskState, StageExecutionState, StageStatus, TaskStatus,
 )
 from sovereign_api.errors import OrchestrationError
-from sovereign_api.task_planning import TaskPlan, TaskStage, TaskStageType
+from sovereign_api.task_planning import StageExecutionKind, TaskPlan, TaskStage, TaskStageType
 
 
 MAX_RUN_STAGES = 16
@@ -43,9 +43,12 @@ class TaskRunExecutionError(OrchestrationError):
 def stage_requires_model_invocation(stage: TaskStage) -> bool:
     """Classify only canonical runtime stage types; unknown types fail closed."""
 
-    if type(stage) is not TaskStage or type(stage.stage_type) is not TaskStageType:
+    if (type(stage) is not TaskStage or type(stage.stage_type) is not TaskStageType
+        or type(stage.execution_kind) is not StageExecutionKind):
         raise InvalidTaskRunError("Task stage type is invalid")
-    if stage.stage_type in _MODEL_STAGE_TYPES:
+    if stage.execution_kind is StageExecutionKind.TOOL and stage.stage_type is TaskStageType.TOOL:
+        return False
+    if stage.execution_kind is StageExecutionKind.MODEL and stage.stage_type in _MODEL_STAGE_TYPES:
         return True
     raise InvalidTaskRunError("Task stage type is unsupported")
 
@@ -71,6 +74,9 @@ def revalidate_agent_task_state(state: AgentTaskState) -> AgentTaskState:
                     stage_id=stage.stage_id,
                     stage_type=stage.stage_type,
                     required_capabilities=stage.required_capabilities,
+                    execution_kind=stage.execution_kind,
+                    tool_id=stage.tool_id,
+                    tool_arguments=stage.tool_arguments,
                 )
                 for stage in state.plan.stages
             ),
@@ -85,6 +91,9 @@ def revalidate_agent_task_state(state: AgentTaskState) -> AgentTaskState:
                 output_reference=stage.output_reference,
                 error_code=stage.error_code,
                 safe_message=stage.safe_message,
+                execution_kind=stage.execution_kind,
+                selected_tool_id=stage.selected_tool_id,
+                output_kind=stage.output_kind,
             )
             for stage in state.stage_states
         )

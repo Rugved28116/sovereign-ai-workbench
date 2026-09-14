@@ -67,6 +67,33 @@ def test_missing_capabilities_are_inferred_before_routing(
     }
 
 
+def test_public_plan_openapi_schema_remains_typed_and_model_only(monkeypatch):
+    monkeypatch.setenv("SOVEREIGN_ENV", "development")
+    app = create_app()
+    schemas = app.openapi()["components"]["schemas"]
+    plan_property = schemas["RoutingInformation"]["properties"]["plan"]
+    plan_ref = next(item["$ref"] for item in plan_property["anyOf"] if "$ref" in item)
+    plan_schema = schemas[plan_ref.rsplit("/", 1)[-1]]
+    stage_ref = plan_schema["properties"]["stages"]["items"]["$ref"]
+    stage_schema = schemas[stage_ref.rsplit("/", 1)[-1]]
+    assert set(plan_schema["properties"]) == {"task_class", "stages"}
+    assert set(stage_schema["properties"]) == {
+        "stage_id", "stage_type", "required_capabilities",
+    }
+    assert set(stage_schema["required"]) == {
+        "stage_id", "stage_type", "required_capabilities",
+    }
+    assert stage_schema["properties"]["required_capabilities"]["items"]["type"] == "string"
+    assert set(stage_schema["properties"]["stage_type"]["enum"]) == {
+        "generate", "code", "document", "vision", "reason",
+    }
+    response = request_app(app, "POST", "/v1/generate", json={"prompt": "Fix this Python bug"})
+    assert response.status_code == 200
+    assert set(response.json()["routing"]["plan"]["stages"][0]) == {
+        "stage_id", "stage_type", "required_capabilities",
+    }
+
+
 def test_explicit_capabilities_bypass_classifier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
