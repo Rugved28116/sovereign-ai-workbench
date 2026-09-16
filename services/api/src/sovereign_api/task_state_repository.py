@@ -550,6 +550,11 @@ class TaskStateRepository(Protocol):
         lease_duration: timedelta = DEFAULT_STAGE_LEASE_DURATION,
     ) -> ClaimedTaskState: ...
 
+    def validate_claimed_execution(
+        self, claimed: ClaimedTaskState,
+        execution_authority: ValidatedStageExecutionLease,
+    ) -> PersistedTaskState: ...
+
     def complete_claim(
         self, task_id: str, stage_id: str, lease_id: str,
         execution_authority: ValidatedStageExecutionLease,
@@ -988,6 +993,62 @@ class SQLiteTaskStateRepository:
             raise StageClaimError("Legacy running stage could not be claimed") from None
         persisted = PersistedTaskState(state, new_version, now, lease)
         return ClaimedTaskState(persisted, lease, _lease_authority(lease, secret))
+
+    def validate_claimed_execution(
+        self, claimed: ClaimedTaskState,
+        execution_authority: ValidatedStageExecutionLease,
+    ) -> PersistedTaskState:
+        """Validate live claim ownership in a short transaction before side effects."""
+        if type(claimed) is not ClaimedTaskState:
+            raise StageLeaseMismatchError("Stage execution lease is invalid")
+        db = self._db()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            now = self._now()
+            row = db.execute(
+                "SELECT state_json, version, created_at, updated_at, persisted_at, "
+                "lease_id, lease_stage_id, lease_claimed_at, lease_expires_at, "
+                "lease_proof, lease_migration_state FROM agent_task_states "
+                "WHERE task_id = ?",
+                (claimed.persisted.state.task_id,),
+            ).fetchone()
+            if row is None:
+                raise TaskNotFoundError("Task was not found")
+            if type(row[1]) is not int or row[1] != claimed.persisted.version:
+                raise StaleTaskStateError("Task version is stale")
+            state = deserialize_task_state(row[0])
+            lease = _lease_from_row(
+                state.task_id, row[1], (row[5], row[6], row[7], row[8]),
+            )
+            secret = _lease_authority_secret(execution_authority)
+            persisted = PersistedTaskState(
+                state, row[1], _timestamp(row[4]), lease,
+            )
+            if (
+                _timestamp(row[2]) != state.created_at
+                or _timestamp(row[3]) != state.updated_at
+                or row[10] != _CURRENT_LEASE_STATE
+                or lease is None or not _valid_lease_proof(row[9])
+                or secret is None
+                or persisted != claimed.persisted
+                or lease != claimed.lease
+                or (execution_authority.lease_id, execution_authority.task_id,
+                    execution_authority.stage_id, execution_authority.claimed_version)
+                != (lease.lease_id, lease.task_id, lease.stage_id,
+                    lease.claimed_version)
+                or not hmac.compare_digest(row[9], _claim_proof(lease, secret))
+            ):
+                raise StageLeaseMismatchError("Stage execution lease is invalid")
+            if lease.lease_expires_at <= now:
+                raise StageLeaseExpiredError("Stage execution lease has expired")
+            db.commit()
+            return persisted
+        except TaskPersistenceError:
+            db.rollback()
+            raise
+        except Exception:
+            db.rollback()
+            raise StageLeaseMismatchError("Stage execution lease is invalid") from None
 
     @staticmethod
     def _validate_claim_completion(

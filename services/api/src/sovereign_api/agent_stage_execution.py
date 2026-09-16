@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 from sovereign_api.agent_task_state import (
@@ -46,6 +46,12 @@ from sovereign_api.workspace_read_file import (
 from sovereign_api.workspace_write_artifact import (
     WORKSPACE_WRITE_ARTIFACT_TOOL_ID, WORKSPACE_WRITE_OPERATION,
 )
+
+if TYPE_CHECKING:
+    from sovereign_api.task_state_repository import (
+        ClaimedTaskState, PersistedTaskState, TaskStateRepository,
+        ValidatedStageExecutionLease,
+    )
 
 
 _SAFE_FAILURE = "Stage execution failed"
@@ -174,6 +180,16 @@ class StageCoordinationReport:
     state: AgentTaskState
     model_invocations: int
     approval_request: ApprovalRequest | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedStageCoordinationReport:
+    """Lease-bound persisted outcome without exposing execution authority."""
+
+    persisted: PersistedTaskState
+    stage_report: StageCoordinationReport
+    claimed_version: int
+    lease_id: str
 
 
 class StageExecutor(Protocol):
@@ -481,6 +497,58 @@ class StageExecutionCoordinator:
     ) -> StageCoordinationReport:
         return await self._advance(task, stage)
 
+    async def execute_claimed_stage_and_persist(
+        self,
+        repository: TaskStateRepository,
+        claimed: ClaimedTaskState,
+        execution_authority: ValidatedStageExecutionLease,
+    ) -> PersistedStageCoordinationReport:
+        """Validate, execute, and lease-complete one already-running persisted stage."""
+        from sovereign_api.task_state_repository import (
+            ClaimedTaskState, PersistedTaskState, ValidatedStageExecutionLease,
+        )
+
+        if (
+            type(claimed) is not ClaimedTaskState
+            or type(execution_authority) is not ValidatedStageExecutionLease
+            or not callable(getattr(repository, "validate_claimed_execution", None))
+            or not callable(getattr(repository, "complete_claim", None))
+        ):
+            raise InvalidStageCoordinationError("Persisted stage claim is invalid")
+        persisted = repository.validate_claimed_execution(
+            claimed, execution_authority,
+        )
+        if type(persisted) is not PersistedTaskState or persisted != claimed.persisted:
+            raise InvalidStageCoordinationError("Persisted stage claim is invalid")
+        task = persisted.state
+        if (
+            task.task_status is not TaskStatus.RUNNING
+            or task.current_stage_id != claimed.lease.stage_id
+        ):
+            raise InvalidStageCoordinationError("Persisted stage claim is not executable")
+        index = next(
+            (position for position, item in enumerate(task.stage_states)
+             if item.stage_id == task.current_stage_id),
+            None,
+        )
+        if index is None or task.stage_states[index].status is not StageStatus.RUNNING:
+            raise InvalidStageCoordinationError("Persisted stage claim is not executable")
+        stage = task.plan.stages[index]
+        report = await self._advance(task, stage, claimed_running=True)
+        saved = repository.complete_claim(
+            task.task_id, stage.stage_id, claimed.lease.lease_id,
+            execution_authority, report.state,
+            expected_version=persisted.version,
+        )
+        if type(saved) is not PersistedTaskState:
+            raise InvalidStageCoordinationError("Persisted stage completion is invalid")
+        return PersistedStageCoordinationReport(
+            persisted=saved,
+            stage_report=report,
+            claimed_version=persisted.version,
+            lease_id=claimed.lease.lease_id,
+        )
+
     def _approval_matches(self, task: AgentTaskState, stage: TaskStage,
                           approval: ApprovalRequest) -> bool:
         if self._tool_executor is None or type(approval) is not ApprovalRequest:
@@ -591,22 +659,29 @@ class StageExecutionCoordinator:
         validated_authorization: ValidatedApprovalAuthorization | None = None,
         granted_permissions: frozenset[ToolPermission] | None = None,
         environment: DeploymentEnvironment | None = None,
+        claimed_running: bool = False,
     ) -> StageCoordinationReport:
         if type(task) is not AgentTaskState or type(stage) is not TaskStage:
             raise InvalidStageCoordinationError("Task or stage is invalid")
         resuming = approved_request is not None
+        if claimed_running and resuming:
+            raise InvalidStageCoordinationError("Persisted approval resume is unsupported")
         if resuming:
             if task.task_status is not TaskStatus.AWAITING_APPROVAL:
                 raise InvalidStageCoordinationError("Task is not awaiting approval")
+        elif claimed_running:
+            if task.task_status is not TaskStatus.RUNNING:
+                raise InvalidStageCoordinationError("Claimed task is not running")
         elif task.task_status not in (TaskStatus.PENDING, TaskStatus.RUNNING):
             raise InvalidStageCoordinationError("Terminal task cannot execute a stage")
-        if task.current_stage_id is not None and not resuming:
+        if task.current_stage_id is not None and not (resuming or claimed_running):
             raise InvalidStageCoordinationError("A stage is already running")
         next_index = (
             next((index for index, item in enumerate(task.stage_states)
                   if item.stage_id == task.current_stage_id), None)
-            if resuming else next((index for index, item in enumerate(task.stage_states)
-                                   if item.status is StageStatus.PENDING), None)
+            if resuming or claimed_running
+            else next((index for index, item in enumerate(task.stage_states)
+                       if item.status is StageStatus.PENDING), None)
         )
         if next_index is None or any(
             item.status is not StageStatus.COMPLETED
@@ -615,6 +690,8 @@ class StageExecutionCoordinator:
             raise InvalidStageCoordinationError("Stage is not the next planned stage")
         if resuming and task.stage_states[next_index].status is not StageStatus.AWAITING_APPROVAL:
             raise InvalidStageCoordinationError("Stage is not awaiting approval")
+        if claimed_running and task.stage_states[next_index].status is not StageStatus.RUNNING:
+            raise InvalidStageCoordinationError("Claimed stage is not running")
         expected = task.plan.stages[next_index]
         if (
             stage.stage_id != expected.stage_id
@@ -655,6 +732,8 @@ class StageExecutionCoordinator:
         # invoke a provider. Clock failure therefore cannot discard a completed
         # provider call and invite a sequential retry of the old snapshot.
         transition_count = (
+            1 + (1 if next_index == len(task.stage_states) - 1 else 0)
+            if claimed_running else
             (1 if task.task_status is TaskStatus.PENDING else 0)
             + 2  # stage start and terminal outcome
             + (1 if next_index == len(task.stage_states) - 1 else 0)
@@ -667,13 +746,14 @@ class StageExecutionCoordinator:
         transition_times = iter(timestamps)
 
         current = task
-        if current.task_status is TaskStatus.PENDING:
-            current = current.start(updated_at=next(transition_times))
-        current = current.update_stage(
-            (current.stage_states[next_index].resume_approval() if resuming
-             else current.stage_states[next_index].start()),
-            updated_at=next(transition_times),
-        )
+        if not claimed_running:
+            if current.task_status is TaskStatus.PENDING:
+                current = current.start(updated_at=next(transition_times))
+            current = current.update_stage(
+                (current.stage_states[next_index].resume_approval() if resuming
+                 else current.stage_states[next_index].start()),
+                updated_at=next(transition_times),
+            )
         terminal_at = next(transition_times)
         task_complete_at = (
             next(transition_times) if next_index == len(task.stage_states) - 1 else None
