@@ -35,6 +35,100 @@ Business code calls capability-oriented internal contracts. Provider adapters ar
 
 See [Architecture](docs/architecture.md) for the planned boundaries.
 
+## System architecture
+
+The diagram below shows the current API workflow, model routing path, local provider boundary, agent execution flow, and task persistence layer.
+
+```mermaid
+flowchart TD
+
+subgraph group_api["API Workflow"]
+  node_api["Sovereign API<br/>[main.py]"]
+  node_classifier["Task Classifier"]
+  node_planner["Task Planner<br/>[task_planning.py]"]
+end
+
+subgraph group_routing["Model Routing"]
+  node_registry_loader["Registry Loader<br/>[loader.py]"]
+  node_registry["Model Registry<br/>[registry.yaml]"]
+  node_router["Model Router<br/>[router.py]"]
+  node_eligibility["Eligibility Filter<br/>[eligibility.py]"]
+  node_optimizer["Model Optimizer<br/>[optimizer.py]"]
+end
+
+subgraph group_providers["Local Providers"]
+  node_adapters["Provider Adapters"]
+  node_transport["Compatible Transport"]
+end
+
+subgraph group_agents["Agent Execution"]
+  node_orchestrator["Task Orchestrator<br/>[orchestration.py]"]
+  node_stage_coordinator["Stage Coordinator"]
+  node_tool_executor["Tool Executor<br/>[tool_execution.py]"]
+  node_tool_policy["Tool Policy<br/>[tool_policy.py]"]
+  node_workspace["Workspace Artifacts"]
+end
+
+subgraph group_persistence["Task Persistence"]
+  node_output_store[("Stage Output Store")]
+  node_task_repository[("Task State Repository")]
+end
+
+node_user(("User"))
+node_local_server["Local Model Server"]
+
+node_user -->|"submits request"| node_api
+node_api -->|"classifies task"| node_classifier
+node_api -->|"plans requirements"| node_planner
+node_api -->|"routes request"| node_router
+node_api -->|"invokes provider"| node_adapters
+node_api -->|"loads registry"| node_registry_loader
+node_registry_loader -->|"reads models"| node_registry
+node_router -->|"filters models"| node_eligibility
+node_router -->|"ranks candidates"| node_optimizer
+node_adapters -->|"delegates completion"| node_transport
+node_transport -->|"posts prompt"| node_local_server
+node_orchestrator -->|"executes stages"| node_stage_coordinator
+node_stage_coordinator -->|"routes model stage"| node_router
+node_stage_coordinator -->|"runs tool stage"| node_tool_executor
+node_tool_executor -->|"checks permissions"| node_tool_policy
+node_stage_coordinator -->|"writes outputs"| node_output_store
+node_stage_coordinator -->|"reads prior output"| node_output_store
+node_stage_coordinator -->|"advances state"| node_task_repository
+node_tool_executor -.->|"writes artifacts"| node_workspace
+
+click node_api "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/main.py"
+click node_classifier "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/task_classification.py"
+click node_planner "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/task_planning.py"
+click node_registry_loader "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/registry/loader.py"
+click node_registry "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/models/registry.yaml"
+click node_router "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/routing/router.py"
+click node_eligibility "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/routing/eligibility.py"
+click node_optimizer "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/routing/optimizer.py"
+click node_adapters "https://github.com/rugved28116/sovereign-ai-workbench/tree/master/services/api/src/sovereign_api/providers"
+click node_transport "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/providers/_openai_compatible.py"
+click node_orchestrator "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/orchestration.py"
+click node_stage_coordinator "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/agent_stage_execution.py"
+click node_tool_executor "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/tool_execution.py"
+click node_tool_policy "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/tool_policy.py"
+click node_output_store "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/stage_output_store.py"
+click node_task_repository "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/task_state_repository.py"
+click node_workspace "https://github.com/rugved28116/sovereign-ai-workbench/blob/master/services/api/src/sovereign_api/workspace_write_artifact.py"
+
+classDef toneNeutral fill:#f8fafc,stroke:#334155,stroke-width:1.5px,color:#0f172a
+classDef toneBlue fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#172554
+classDef toneAmber fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#78350f
+classDef toneMint fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#14532d
+classDef toneRose fill:#ffe4e6,stroke:#e11d48,stroke-width:1.5px,color:#881337
+classDef toneIndigo fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#312e81
+classDef toneTeal fill:#ccfbf1,stroke:#0f766e,stroke-width:1.5px,color:#134e4a
+class node_api,node_classifier,node_planner,node_user toneBlue
+class node_registry_loader,node_registry,node_router,node_eligibility,node_optimizer toneAmber
+class node_adapters,node_transport,node_local_server toneMint
+class node_orchestrator,node_stage_coordinator,node_tool_executor,node_tool_policy,node_workspace toneRose
+class node_output_store,node_task_repository toneIndigo
+```
+
 ## Privacy philosophy
 
 Data sovereignty is the default. The system must not assume internet access, transmit information externally, or silently broaden a user's permissions. Secrets belong outside version control. Security-sensitive operations should fail closed, tool access should be explicit and auditable, and generated code should eventually execute only inside constrained sandboxes.
