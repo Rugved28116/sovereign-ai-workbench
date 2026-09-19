@@ -23,13 +23,16 @@ from sovereign_api.tool_execution import (
     ExecutableRegistration,
     ExecutableToolRegistry,
     PolicyEnforcedToolExecutor,
+    _create_internal_tool_invocation_boundary,
     ToolApprovalRequiredError,
     ToolExecutionIdentityError,
     ToolImplementationUnavailableError,
     ToolInvocationError,
     ToolPermissionDeniedError,
 )
-from sovereign_api.tool_policy import DeterministicToolPolicyEvaluator
+from sovereign_api.tool_policy import (
+    DeterministicToolPolicyEvaluator, ToolPermissionDecision,
+)
 from sovereign_api.workspace_read_file import (
     FILESYSTEM_READ_PERMISSION,
     WORKSPACE_READ_FILE_DESCRIPTOR,
@@ -141,6 +144,15 @@ def test_approval_required_never_invokes_implementation() -> None:
         ExecutableToolRegistry((tool,)),
     )
     request = _request(descriptor.tool_id)
+
+    boundary = _create_internal_tool_invocation_boundary(executor)
+    assert boundary is not None
+    persisted_evaluation = boundary.evaluate(
+        request, granted_permissions=frozenset({permission}),
+        environment=DeploymentEnvironment.DEVELOPMENT,
+    )
+    assert persisted_evaluation.decision is ToolPermissionDecision.REQUIRE_APPROVAL
+    assert persisted_evaluation.authorization is None
 
     with pytest.raises(ToolApprovalRequiredError):
         _run(executor, request, permissions=frozenset({permission}))

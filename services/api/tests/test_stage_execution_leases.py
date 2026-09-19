@@ -24,10 +24,11 @@ from sovereign_api.task_state_repository import (
     StageLeaseExpiredError, StageLeaseMismatchError, StaleTaskStateError,
     TaskPersistenceError, ValidatedStageExecutionLease, serialize_task_state,
 )
+from sovereign_api.stage_execution_records import StageExecutionAttemptMismatchError
 
 
 def repo(path, *, clock=None):
-    return SQLiteTaskStateRepository(
+    return SQLiteTaskStateRepository._for_test(
         path, clock=clock if clock is not None else (lambda: at(10)),
     )
 
@@ -227,29 +228,30 @@ def test_awaiting_approval_cannot_be_normally_claimed(tmp_path):
         assert loaded.lease is None
 
 
-def test_valid_owner_completes_and_clears_lease(tmp_path):
+def test_model_completion_without_execution_evidence_is_rejected(tmp_path):
     path = tmp_path / "tasks.sqlite"
     with repo(path) as repository:
         repository.create(model_task())
         claim = repository.claim_next_stage(
             "task-1", "stage-1", expected_version=1,
         )
-        saved = finish(repository, claim, completed_state(claim))
-        assert saved.version == 3 and saved.lease is None
-        assert saved.state.task_status is TaskStatus.COMPLETED
-        assert repository.get("task-1") == saved
+        with pytest.raises(StageExecutionAttemptMismatchError):
+            finish(repository, claim, completed_state(claim))
+        persisted = repository.get("task-1")
+        assert persisted.version == 2 and persisted.lease == claim.lease
+        assert persisted.state.task_status is TaskStatus.RUNNING
 
 
-def test_valid_owner_persists_failure_and_clears_lease(tmp_path):
+def test_model_failure_without_execution_evidence_is_rejected(tmp_path):
     path = tmp_path / "tasks.sqlite"
     with repo(path) as repository:
         repository.create(model_task())
         claim = repository.claim_next_stage(
             "task-1", "stage-1", expected_version=1,
         )
-        saved = finish(repository, claim, failed_state(claim))
-        assert saved.version == 3 and saved.lease is None
-        assert saved.state.task_status is TaskStatus.FAILED
+        with pytest.raises(StageExecutionAttemptMismatchError):
+            finish(repository, claim, failed_state(claim))
+        assert repository.get("task-1").lease == claim.lease
 
 
 def test_wrong_lease_identity_and_forged_capability_fail_closed(tmp_path):
@@ -502,7 +504,8 @@ def test_authority_operations_read_repository_clock_once(tmp_path):
         )
         assert clock.calls == before_claim + 1
         before_completion = clock.calls
-        finish(repository, claim, completed_state(claim))
+        with pytest.raises(StageExecutionAttemptMismatchError):
+            finish(repository, claim, completed_state(claim))
         assert clock.calls == before_completion + 1
 
 
@@ -605,9 +608,9 @@ def test_pre_lease_running_row_is_marked_recovered_and_completed(tmp_path):
 
     with repo(path) as reopened:
         assert reopened.get("task-1").lease == recovered.lease
-        saved = finish(reopened, recovered, completed_state(recovered))
-        assert saved.version == 3
-        assert saved.state.task_status is TaskStatus.COMPLETED
+        with pytest.raises(StageExecutionAttemptMismatchError):
+            finish(reopened, recovered, completed_state(recovered))
+        assert reopened.get("task-1").lease == recovered.lease
 
 
 def test_unrelated_authority_cannot_complete_recovered_legacy_claim(tmp_path):

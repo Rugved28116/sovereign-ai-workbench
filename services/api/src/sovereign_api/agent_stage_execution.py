@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -23,8 +26,10 @@ from sovereign_api.providers.base import ModelProvider
 from sovereign_api.prompt_validation import MAX_PROMPT_LENGTH
 from sovereign_api.registry.models import valid_model_id
 from sovereign_api.routing import DeterministicModelRouter
+from sovereign_api.routing.eligibility import SovereignEligibilityFilter
+from sovereign_api.routing.optimizer import DeterministicModelOptimizer
 from sovereign_api.stage_output_store import (
-    MAX_STAGE_OUTPUT_BYTES, StageOutput, StageOutputReference,
+    InMemoryStageOutputStore, MAX_STAGE_OUTPUT_BYTES, StageOutput, StageOutputReference,
     StageOutputStore, StageOutputStoreError, StageOutputNotFoundError,
 )
 from sovereign_api.task_planning import StageExecutionKind, TaskStage, TaskStageType
@@ -33,8 +38,9 @@ from sovereign_api.tool_contracts import (
 )
 from sovereign_api.tool_execution import (
     ToolExecutor, ToolApprovalRequiredError, ToolPermissionDeniedError,
-    ToolExecutionError,
+    ToolExecutionError, _create_internal_tool_invocation_boundary,
 )
+from sovereign_api.tool_policy import ToolPermissionDecision
 from sovereign_api.tool_approval import (
     ApprovalChoice, ApprovalDecision, ApprovalRequest,
     ValidatedApprovalAuthorization, _issue_validated_authorization,
@@ -277,6 +283,219 @@ class RoutedAgentStageExecutor:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedModelInvocation:
+    task_id: str
+    stage_id: str
+    model_id: str
+    provider_id: str
+    request: ModelRequest
+    request_digest: str
+
+
+class TrustedModelInvocationReceipt:
+    """Opaque proof of one captured provider invocation."""
+
+    __slots__ = (
+        "task_id", "stage_id", "model_id", "attempt_id", "idempotency_key",
+        "request_digest", "lease_id", "claimed_version", "__weakref__",
+    )
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise InvalidStageCoordinationError("Model invocation receipt is invalid")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("Model invocation receipt is immutable")
+
+    def __copy__(self) -> object:
+        raise TypeError("Model invocation receipt cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> object:
+        raise TypeError("Model invocation receipt cannot be copied")
+
+    def __reduce__(self) -> object:
+        raise TypeError("Model invocation receipt cannot be serialized")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        raise TypeError("Model invocation receipt cannot be serialized")
+
+
+_MODEL_BOUNDARIES: dict[int, tuple[object, ...]] = {}
+_MODEL_RECEIPTS: dict[int, tuple[object, ...]] = {}
+
+
+class _TrustedModelInvocationBoundary:
+    __slots__ = ("__weakref__",)
+
+    def prepare(
+        self, task: AgentTaskState, stage: TaskStage, prompt: str,
+    ) -> _PreparedModelInvocation:
+        stored = _model_boundary_components(self)
+        router, providers = stored
+        decision = router.route(frozenset(stage.required_capabilities))
+        provider = next((item for item in providers if item[0] == decision.model.provider), None)
+        if provider is None:
+            raise InvalidStageCoordinationError("Persisted model provider is unavailable")
+        request = ModelRequest(model_id=decision.model.id, prompt=prompt)
+        payload = json.dumps({
+            "schema_version": 1, "task_id": task.task_id,
+            "stage_id": stage.stage_id, "stage_type": stage.stage_type.value,
+            "required_capabilities": list(stage.required_capabilities),
+            "model_id": decision.model.id, "provider_id": decision.model.provider,
+            "prompt_sha256": hashlib.sha256(
+                prompt.encode("utf-8", errors="strict")
+            ).hexdigest(),
+        }, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return _PreparedModelInvocation(
+            task.task_id, stage.stage_id, decision.model.id,
+            decision.model.provider, request, hashlib.sha256(payload).hexdigest(),
+        )
+
+    async def invoke(
+        self, repository: object, prepared: _PreparedModelInvocation,
+        permit: object,
+    ) -> TrustedModelInvocationReceipt:
+        from sovereign_api.task_state_repository import SQLiteTaskStateRepository
+        if type(repository) is not SQLiteTaskStateRepository:
+            raise InvalidStageCoordinationError("Model invocation repository is invalid")
+        identity = repository.consume_model_invocation_permit(permit)
+        (attempt_id, key, task_id, stage_id, model_id, request_digest,
+         lease_id, claimed_version) = identity
+        if (
+            type(prepared) is not _PreparedModelInvocation
+            or (task_id, stage_id, model_id, request_digest) != (
+                prepared.task_id, prepared.stage_id, prepared.model_id,
+                prepared.request_digest,
+            )
+        ):
+            raise InvalidStageCoordinationError("Model invocation permit is invalid")
+        _, providers = _model_boundary_components(self)
+        registered = next(
+            (item for item in providers if item[0] == prepared.provider_id), None,
+        )
+        if registered is None:
+            raise InvalidStageCoordinationError("Persisted model provider is unavailable")
+        content = error_code = None
+        try:
+            candidate = await registered[1](prepared.request)
+        except Exception:
+            error_code = "provider_failed"
+        else:
+            if (
+                type(candidate) is ModelResponse
+                and candidate.model_id == prepared.model_id
+                and type(candidate.content) is str and candidate.content.strip()
+            ):
+                try:
+                    encoded = candidate.content.encode("utf-8", errors="strict")
+                except UnicodeEncodeError:
+                    encoded = b""
+                if encoded and len(encoded) <= MAX_STAGE_OUTPUT_BYTES:
+                    content = candidate.content
+                else:
+                    error_code = "provider_response_invalid"
+            else:
+                error_code = "provider_response_invalid"
+        snapshot_digest = hashlib.sha256(json.dumps(
+            {"content": content, "error_code": error_code,
+             "model_id": prepared.model_id},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+        receipt = object.__new__(TrustedModelInvocationReceipt)
+        values = (task_id, stage_id, model_id, attempt_id, key,
+                  request_digest, lease_id, claimed_version)
+        for name, value in zip(
+            ("task_id", "stage_id", "model_id", "attempt_id", "idempotency_key",
+             "request_digest", "lease_id", "claimed_version"), values, strict=True,
+        ):
+            object.__setattr__(receipt, name, value)
+        receipt_id = id(receipt)
+        def discard(reference: object) -> None:
+            current = _MODEL_RECEIPTS.get(receipt_id)
+            if current is not None and current[0] is reference:
+                _MODEL_RECEIPTS.pop(receipt_id, None)
+        _MODEL_RECEIPTS[receipt_id] = (
+            weakref.ref(receipt, discard), *values, content, error_code, snapshot_digest,
+        )
+        return receipt
+
+
+def _model_boundary_components(
+    boundary: object,
+) -> tuple[DeterministicModelRouter, tuple[tuple[str, Callable], ...]]:
+    if type(boundary) is not _TrustedModelInvocationBoundary:
+        raise InvalidStageCoordinationError("Persisted model boundary is invalid")
+    stored = _MODEL_BOUNDARIES.get(id(boundary))
+    if stored is None or stored[0]() is not boundary:
+        raise InvalidStageCoordinationError("Persisted model boundary is invalid")
+    return stored[1], stored[2]
+
+
+def _create_trusted_model_boundary(
+    executor: object,
+) -> _TrustedModelInvocationBoundary | None:
+    if type(executor) is not RoutedAgentStageExecutor:
+        return None
+    try:
+        router = executor._router
+        if (
+            type(router) is not DeterministicModelRouter
+            or type(router._eligibility_filter) is not SovereignEligibilityFilter
+            or type(router._optimizer) is not DeterministicModelOptimizer
+            or type(executor._providers) is not MappingProxyType
+        ):
+            return None
+        registry = type(router._registry).model_validate(
+            router._registry.model_dump(mode="json")
+        )
+        captured_router = DeterministicModelRouter(registry, router._environment)
+        providers = tuple(
+            (provider_id, provider.generate)
+            for provider_id, provider in executor._providers.items()
+            if type(provider_id) is str and callable(provider.generate)
+        )
+        if len(providers) != len(executor._providers):
+            return None
+        boundary = object.__new__(_TrustedModelInvocationBoundary)
+        identity = id(boundary)
+        def discard(reference: object) -> None:
+            current = _MODEL_BOUNDARIES.get(identity)
+            if current is not None and current[0] is reference:
+                _MODEL_BOUNDARIES.pop(identity, None)
+        _MODEL_BOUNDARIES[identity] = (
+            weakref.ref(boundary, discard), captured_router, providers,
+        )
+        return boundary
+    except Exception:
+        return None
+
+
+def _model_receipt_outcome(
+    receipt: object, *, task_id: str, stage_id: str, model_id: str,
+    attempt_id: str, idempotency_key: str, request_digest: str,
+    lease_id: str, claimed_version: int, consume: bool,
+) -> tuple[str | None, str | None]:
+    if type(receipt) is not TrustedModelInvocationReceipt:
+        raise InvalidStageCoordinationError("Model invocation receipt is invalid")
+    stored = _MODEL_RECEIPTS.get(id(receipt))
+    expected = (task_id, stage_id, model_id, attempt_id, idempotency_key,
+                request_digest, lease_id, claimed_version)
+    visible = (receipt.task_id, receipt.stage_id, receipt.model_id,
+               receipt.attempt_id, receipt.idempotency_key,
+               receipt.request_digest, receipt.lease_id, receipt.claimed_version)
+    if stored is None or stored[0]() is not receipt or stored[1:9] != expected or visible != expected:
+        raise InvalidStageCoordinationError("Model invocation receipt is invalid")
+    digest = hashlib.sha256(json.dumps(
+        {"content": stored[9], "error_code": stored[10], "model_id": model_id},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(digest, stored[11]):
+        raise InvalidStageCoordinationError("Model invocation receipt is invalid")
+    if consume:
+        _MODEL_RECEIPTS.pop(id(receipt), None)
+    return stored[9], stored[10]
+
+
 def _fits_stage_output(text: str) -> bool:
     if type(text) is not str or len(text) > MAX_STAGE_OUTPUT_BYTES:
         return False
@@ -284,6 +503,57 @@ def _fits_stage_output(text: str) -> bool:
         return len(text.encode("utf-8", errors="strict")) <= MAX_STAGE_OUTPUT_BYTES
     except UnicodeEncodeError:
         return False
+
+
+def _trusted_tool_result(
+    stage: TaskStage, request: ToolRequest, result: ToolResult | None,
+    error_code: str | None,
+) -> StageExecutionResult:
+    if error_code is not None:
+        code = error_code
+    elif (
+        type(result) is not ToolResult
+        or result.request_id != request.request_id
+        or result.tool_id != stage.tool_id
+    ):
+        code = "tool_invalid_result"
+    elif result.status is ToolResultStatus.FAILED:
+        code = "tool_failed"
+    elif result.status is ToolResultStatus.SUCCEEDED and (
+        (
+            stage.tool_id == WORKSPACE_READ_FILE_TOOL_ID
+            and result.text_content is not None
+            and result.output_reference is None
+        )
+        or (
+            stage.tool_id == WORKSPACE_WRITE_ARTIFACT_TOOL_ID
+            and result.output_reference is not None
+            and result.text_content is None
+        )
+    ):
+        if result.output_reference is not None and not valid_artifact_reference(
+            result.output_reference
+        ):
+            code = "tool_invalid_result"
+        elif result.text_content is not None and not _fits_stage_output(
+            result.text_content
+        ):
+            code = "tool_output_too_large"
+        else:
+            return StageExecutionResult(
+                stage_id=stage.stage_id, status=StageStatus.COMPLETED,
+                execution_kind=StageExecutionKind.TOOL,
+                selected_tool_id=stage.tool_id,
+                text_content=result.text_content,
+                output_reference=result.output_reference,
+            )
+    else:
+        code = "tool_invalid_result"
+    return StageExecutionResult.failed(
+        stage.stage_id, error_code=code,
+        execution_kind=StageExecutionKind.TOOL,
+        selected_tool_id=stage.tool_id,
+    )
 
 
 class ToolBackedStageExecutor:
@@ -330,9 +600,9 @@ class ToolBackedStageExecutor:
             )
         request = ToolRequest(
             request_id=approved_request.request_id if approved_request is not None else uuid4().hex,
-            tool_id=stage.tool_id,
-            operation=operation, arguments=stage.tool_arguments,
-            task_id=task.task_id, stage_id=stage.stage_id,
+            tool_id=stage.tool_id, operation=operation,
+            arguments=stage.tool_arguments, task_id=task.task_id,
+            stage_id=stage.stage_id,
         )
         try:
             effective_grants = self._permissions if granted_permissions is None else granted_permissions
@@ -453,6 +723,36 @@ def build_chained_stage_prompt(
     return prompt
 
 
+_PERSISTED_COORDINATOR_AUTHORITIES: dict[int, tuple[object, ...]] = {}
+
+
+def _register_persisted_coordinator_authority(
+    coordinator: StageExecutionCoordinator, *, boundary: object,
+    model_boundary: object, output_store: object,
+) -> None:
+    identity = id(coordinator)
+
+    def discard(reference: object) -> None:
+        current = _PERSISTED_COORDINATOR_AUTHORITIES.get(identity)
+        if current is not None and current[0] is reference:
+            _PERSISTED_COORDINATOR_AUTHORITIES.pop(identity, None)
+
+    _PERSISTED_COORDINATOR_AUTHORITIES[identity] = (
+        weakref.ref(coordinator, discard), boundary, model_boundary, output_store,
+    )
+
+
+def _persisted_coordinator_authority(
+    coordinator: StageExecutionCoordinator,
+) -> tuple[object, object, object]:
+    stored = _PERSISTED_COORDINATOR_AUTHORITIES.get(id(coordinator))
+    if stored is None or stored[0]() is not coordinator:
+        raise InvalidStageCoordinationError(
+            "Persisted coordinator authority is unavailable"
+        )
+    return stored[1], stored[2], stored[3]
+
+
 class StageExecutionCoordinator:
     """Advance exactly one next-pending stage through immutable state transitions."""
 
@@ -467,12 +767,27 @@ class StageExecutionCoordinator:
         self._executor = executor
         self._output_store = output_store
         self._clock = clock if clock is not None else lambda: datetime.now(UTC)
+        self._granted_tool_permissions = granted_tool_permissions
+        self._tool_environment = tool_environment
         self._tool_executor = (
             ToolBackedStageExecutor(
                 tool_executor, granted_permissions=granted_tool_permissions,
                 environment=tool_environment,
             ) if tool_executor is not None and type(tool_environment) is DeploymentEnvironment
             else None
+        )
+        trusted_tool_store = (
+            output_store if type(output_store) is InMemoryStageOutputStore else None
+        )
+        boundary = _create_internal_tool_invocation_boundary(
+            tool_executor, output_store=trusted_tool_store,
+        )
+        if trusted_tool_store is None:
+            boundary = None
+        _register_persisted_coordinator_authority(
+            self, boundary=boundary,
+            model_boundary=_create_trusted_model_boundary(executor),
+            output_store=trusted_tool_store,
         )
 
     def _timestamp_after(self, previous: datetime) -> datetime:
@@ -505,20 +820,37 @@ class StageExecutionCoordinator:
     ) -> PersistedStageCoordinationReport:
         """Validate, execute, and lease-complete one already-running persisted stage."""
         from sovereign_api.task_state_repository import (
-            ClaimedTaskState, PersistedTaskState, ValidatedStageExecutionLease,
+            ClaimedTaskState, PersistedTaskState, PreparedStageExecution,
+            ValidatedStageExecutionLease,
+        )
+        from sovereign_api.stage_execution_records import (
+            ExecutionResultDurability, StageExecutionPreparationDecision,
+            SuccessfulResultUnavailableError, stage_text_digest,
+        )
+
+        persisted_boundary, persisted_model_boundary, persisted_output_store = (
+            _persisted_coordinator_authority(self)
         )
 
         if (
             type(claimed) is not ClaimedTaskState
             or type(execution_authority) is not ValidatedStageExecutionLease
             or not callable(getattr(repository, "validate_claimed_execution", None))
+            or not callable(getattr(repository, "prepare_stage_execution", None))
+            or not callable(getattr(repository, "authorize_attempt_invocation", None))
+            or not callable(getattr(repository, "consume_stage_invocation_permit", None))
+            or not callable(getattr(repository, "record_stage_execution_outcome", None))
+            or not callable(getattr(repository, "suspend_claim_for_approval", None))
             or not callable(getattr(repository, "complete_claim", None))
         ):
             raise InvalidStageCoordinationError("Persisted stage claim is invalid")
         persisted = repository.validate_claimed_execution(
             claimed, execution_authority,
         )
-        if type(persisted) is not PersistedTaskState or persisted != claimed.persisted:
+        if (
+            type(persisted) is not PersistedTaskState
+            or persisted != claimed.persisted
+        ):
             raise InvalidStageCoordinationError("Persisted stage claim is invalid")
         task = persisted.state
         if (
@@ -534,7 +866,370 @@ class StageExecutionCoordinator:
         if index is None or task.stage_states[index].status is not StageStatus.RUNNING:
             raise InvalidStageCoordinationError("Persisted stage claim is not executable")
         stage = task.plan.stages[index]
-        report = await self._advance(task, stage, claimed_running=True)
+        prepared = None
+        report = None
+        model_receipt = None
+        model_preparation = None
+        if stage.execution_kind is StageExecutionKind.TOOL:
+            prepared = repository.prepare_stage_execution(
+                claimed, execution_authority, admit_attempt=False,
+            )
+            if prepared is None:
+                operation = ToolBackedStageExecutor._OPERATIONS.get(stage.tool_id)
+                if operation is None or persisted_boundary is None:
+                    policy_result = StageExecutionResult.failed(
+                        stage.stage_id, error_code="tool_unavailable",
+                        execution_kind=StageExecutionKind.TOOL,
+                        selected_tool_id=stage.tool_id,
+                    )
+                    request = None
+                    evaluation = None
+                else:
+                    request = ToolRequest(
+                        request_id=uuid4().hex, tool_id=stage.tool_id,
+                        operation=operation, arguments=stage.tool_arguments,
+                        task_id=task.task_id, stage_id=stage.stage_id,
+                    )
+                    evaluation = persisted_boundary.evaluate(
+                        request,
+                        granted_permissions=self._granted_tool_permissions,
+                        environment=self._tool_environment,
+                    )
+                    if evaluation.decision is ToolPermissionDecision.DENY:
+                        policy_result = StageExecutionResult.failed(
+                            stage.stage_id, error_code="tool_denied",
+                            execution_kind=StageExecutionKind.TOOL,
+                            selected_tool_id=stage.tool_id,
+                        )
+                    elif evaluation.decision is ToolPermissionDecision.REQUIRE_APPROVAL:
+                        descriptor = persisted_boundary.descriptor(stage.tool_id)
+                        approval = ApprovalRequest(
+                            approval_id=uuid4().hex,
+                            request_id=request.request_id,
+                            task_id=task.task_id, stage_id=stage.stage_id,
+                            tool_id=stage.tool_id, operation=operation,
+                            requested_permissions=descriptor.required_permissions,
+                            risk_level=descriptor.risk_level,
+                            side_effect_level=descriptor.side_effect_level,
+                            created_at=self._timestamp_after(task.updated_at),
+                            safe_summary="Tool execution requires approval",
+                            request_fingerprint=request_fingerprint(
+                                request, descriptor.required_permissions,
+                            ),
+                        )
+                        policy_result = StageExecutionResult(
+                            stage_id=stage.stage_id,
+                            status=StageStatus.AWAITING_APPROVAL,
+                            execution_kind=StageExecutionKind.TOOL,
+                            selected_tool_id=stage.tool_id,
+                            approval_request=approval,
+                        )
+                    else:
+                        policy_result = None
+                if policy_result is not None:
+                    report = await self._advance(
+                        task, stage, claimed_running=True,
+                        precomputed_result=policy_result,
+                        output_store=persisted_output_store,
+                    )
+                else:
+                    assert request is not None and evaluation is not None
+                    if evaluation.authorization is None:
+                        raise InvalidStageCoordinationError(
+                            "Persisted tool policy authorization is invalid"
+                        )
+                    prepared = repository.prepare_stage_execution(
+                        claimed, execution_authority,
+                    )
+                    if (
+                        type(prepared) is not PreparedStageExecution
+                        or prepared.decision
+                        is not StageExecutionPreparationDecision.EXECUTE
+                        or prepared.execution_authority is None
+                    ):
+                        raise InvalidStageCoordinationError(
+                            "Persisted stage execution preparation is invalid"
+                        )
+                    invocation_permit = repository.authorize_attempt_invocation(
+                        claimed, execution_authority, prepared,
+                        prepared.execution_authority,
+                    )
+                    receipt = await persisted_boundary.invoke(
+                        repository, request, evaluation.authorization,
+                        invocation_permit,
+                    )
+                    outcome = persisted_boundary.inspect_receipt(
+                        receipt, task_id=task.task_id, stage_id=stage.stage_id,
+                        tool_id=stage.tool_id,
+                        attempt_id=prepared.execution_authority.attempt_id,
+                        idempotency_key=prepared.record.idempotency_key.value,
+                        lease_id=claimed.lease.lease_id,
+                        claimed_version=claimed.lease.claimed_version,
+                    )
+                    trusted_result = _trusted_tool_result(
+                        stage, request, outcome.result, outcome.error_code,
+                    )
+                    report = await self._advance(
+                        task, stage, claimed_running=True,
+                        precomputed_result=trusted_result,
+                        output_store=persisted_output_store,
+                    )
+                if report.state.task_status is TaskStatus.AWAITING_APPROVAL:
+                    if prepared is not None:
+                        raise InvalidStageCoordinationError(
+                            "Approval cannot consume a physical execution attempt"
+                        )
+                    saved = repository.suspend_claim_for_approval(
+                        claimed, execution_authority, report.state,
+                    )
+                    return PersistedStageCoordinationReport(
+                        persisted=saved,
+                        stage_report=report,
+                        claimed_version=persisted.version,
+                        lease_id=claimed.lease.lease_id,
+                    )
+                if prepared is None:
+                    saved = repository.complete_claim(
+                        task.task_id, stage.stage_id, claimed.lease.lease_id,
+                        execution_authority, report.state,
+                        expected_version=persisted.version,
+                    )
+                    return PersistedStageCoordinationReport(
+                        persisted=saved,
+                        stage_report=report,
+                        claimed_version=persisted.version,
+                        lease_id=claimed.lease.lease_id,
+                    )
+        else:
+            if (
+                persisted_model_boundary is None
+                or type(persisted_output_store) is not InMemoryStageOutputStore
+            ):
+                raise InvalidStageCoordinationError(
+                    "Persisted model execution requires trusted dependencies"
+                )
+            previous_output = None
+            if index > 0:
+                previous_stage = task.stage_states[index - 1]
+                if (
+                    previous_stage.output_reference is None
+                    or previous_stage.output_kind is not StageOutputKind.TEXT
+                ):
+                    raise StageOutputNotFoundError("Previous stage output is unavailable")
+                previous_output = persisted_output_store.get(
+                    StageOutputReference(previous_stage.output_reference),
+                    task_id=task.task_id, stage_id=previous_stage.stage_id,
+                )
+                if (
+                    type(previous_output) is not StageOutput
+                    or previous_output.task_id != task.task_id
+                    or previous_output.stage_id != previous_stage.stage_id
+                ):
+                    raise StageOutputNotFoundError("Previous stage output is unavailable")
+                try:
+                    previous_record = repository.get_stage_execution_record(
+                        task.task_id, previous_stage.stage_id,
+                    )
+                    if (
+                        previous_record.status.value != "succeeded"
+                        or previous_record.result_content_digest is None
+                        or stage_text_digest(previous_output.text_content)
+                        != previous_record.result_content_digest
+                    ):
+                        raise ValueError
+                except Exception:
+                    raise StageOutputNotFoundError(
+                        "Previous stage output is unavailable"
+                    ) from None
+            prompt = build_chained_stage_prompt(task, stage, previous_output)
+            model_preparation = persisted_model_boundary.prepare(task, stage, prompt)
+            prepared = repository.prepare_stage_execution(
+                claimed, execution_authority,
+            )
+        if type(prepared) is not PreparedStageExecution:
+            raise InvalidStageCoordinationError(
+                "Persisted stage execution preparation is invalid"
+            )
+        if prepared.decision is StageExecutionPreparationDecision.KNOWN_SUCCESS:
+            if prepared.record.result_durability is ExecutionResultDurability.EPHEMERAL:
+                if type(persisted_output_store) is not InMemoryStageOutputStore:
+                    raise SuccessfulResultUnavailableError(
+                        "Successful stage result requires reconciliation"
+                    )
+                try:
+                    recovered_output = persisted_output_store.get(
+                        StageOutputReference(prepared.record.safe_result_reference),
+                        task_id=task.task_id, stage_id=stage.stage_id,
+                    )
+                    if (
+                        type(recovered_output) is not StageOutput
+                        or recovered_output.task_id != task.task_id
+                        or recovered_output.stage_id != stage.stage_id
+                        or stage_text_digest(recovered_output.text_content)
+                        != prepared.record.result_content_digest
+                    ):
+                        raise ValueError
+                except Exception:
+                    raise SuccessfulResultUnavailableError(
+                        "Successful stage result requires reconciliation"
+                    ) from None
+            elif prepared.record.result_durability is ExecutionResultDurability.DURABLE:
+                if (
+                    stage.execution_kind is not StageExecutionKind.TOOL
+                    or stage.tool_id != WORKSPACE_WRITE_ARTIFACT_TOOL_ID
+                    or persisted_boundary is None
+                    or prepared.record.safe_result_reference is None
+                    or prepared.record.result_content_digest is None
+                    or not persisted_boundary.verify_artifact(
+                        tool_id=stage.tool_id,
+                        reference=prepared.record.safe_result_reference,
+                        content_digest=prepared.record.result_content_digest,
+                    )
+                ):
+                    raise SuccessfulResultUnavailableError(
+                        "Successful stage result requires reconciliation"
+                    )
+            else:
+                raise SuccessfulResultUnavailableError(
+                    "Successful stage result requires reconciliation"
+                )
+            terminal_at = self._timestamp_after(task.updated_at)
+            completed_stage = task.stage_states[index].complete(
+                output_reference=prepared.record.safe_result_reference,
+                selected_model_id=prepared.record.selected_model_id,
+                selected_tool_id=prepared.record.selected_tool_id,
+                output_kind=prepared.record.output_kind,
+            )
+            terminal = task.update_stage(completed_stage, updated_at=terminal_at)
+            if index == len(task.stage_states) - 1:
+                terminal = terminal.complete(
+                    updated_at=self._timestamp_after(terminal.updated_at),
+                )
+            report = StageCoordinationReport(terminal, 0)
+        else:
+            if prepared.execution_authority is None:
+                raise InvalidStageCoordinationError(
+                    "Persisted stage execution preparation is invalid"
+                )
+            if stage.execution_kind is StageExecutionKind.MODEL:
+                invocation_permit = repository.authorize_model_attempt_invocation(
+                    claimed, execution_authority, prepared,
+                    prepared.execution_authority,
+                    model_id=model_preparation.model_id,
+                    request_digest=model_preparation.request_digest,
+                )
+                model_receipt = await persisted_model_boundary.invoke(
+                    repository, model_preparation, invocation_permit,
+                )
+                content, model_error = _model_receipt_outcome(
+                    model_receipt, task_id=task.task_id, stage_id=stage.stage_id,
+                    model_id=model_preparation.model_id,
+                    attempt_id=prepared.execution_authority.attempt_id,
+                    idempotency_key=prepared.record.idempotency_key.value,
+                    request_digest=model_preparation.request_digest,
+                    lease_id=claimed.lease.lease_id,
+                    claimed_version=claimed.lease.claimed_version,
+                    consume=False,
+                )
+                trusted_model_result = (
+                    StageExecutionResult(
+                        stage_id=stage.stage_id, status=StageStatus.COMPLETED,
+                        text_content=content,
+                        selected_model_id=model_preparation.model_id,
+                        model_invocations=1,
+                    ) if content is not None and model_error is None else
+                    StageExecutionResult.failed(
+                        stage.stage_id,
+                        error_code=model_error or "provider_response_invalid",
+                        selected_model_id=model_preparation.model_id,
+                        model_invocations=1,
+                    )
+                )
+                report = await self._advance(
+                    task, stage, claimed_running=True,
+                    precomputed_result=trusted_model_result,
+                    output_store=persisted_output_store,
+                )
+            elif report is None:
+                report = await self._advance(
+                    task, stage, claimed_running=True,
+                    output_store=persisted_output_store,
+                )
+            completed = next(
+                item for item in report.state.stage_states
+                if item.stage_id == stage.stage_id
+            )
+            result_digest = None
+            if (
+                completed.status is StageStatus.COMPLETED
+                and completed.output_kind is StageOutputKind.TEXT
+            ):
+                try:
+                    stored_output = persisted_output_store.get(
+                        StageOutputReference(completed.output_reference),
+                        task_id=task.task_id, stage_id=stage.stage_id,
+                    )
+                    result_digest = stage_text_digest(stored_output.text_content)
+                except Exception:
+                    raise InvalidStageCoordinationError(
+                        "Persisted stage output is unavailable"
+                    ) from None
+                if stage.execution_kind is StageExecutionKind.TOOL:
+                    persisted_boundary.bind_text_output(
+                        receipt, output_reference=completed.output_reference,
+                    )
+            elif (
+                completed.status is StageStatus.COMPLETED
+                and completed.output_kind is StageOutputKind.ARTIFACT
+                and stage.execution_kind is StageExecutionKind.TOOL
+                and stage.tool_id == WORKSPACE_WRITE_ARTIFACT_TOOL_ID
+            ):
+                content = stage.tool_arguments.get("content")
+                if type(content) is not str:
+                    raise InvalidStageCoordinationError(
+                        "Persisted artifact identity is invalid"
+                    )
+                # A registered implementation's success reference is not proof
+                # that it wrote the requested bytes.  Bind the receipt through
+                # the captured descriptor-relative artifact verifier before the
+                # receipt is allowed to authorize a durable success.
+                persisted_boundary.bind_verified_artifact(
+                    receipt, expected_digest=stage_text_digest(content),
+                )
+                trusted = persisted_boundary.inspect_receipt(
+                    receipt,
+                    task_id=task.task_id, stage_id=stage.stage_id,
+                    tool_id=stage.tool_id,
+                    attempt_id=prepared.execution_authority.attempt_id,
+                    idempotency_key=prepared.record.idempotency_key.value,
+                    lease_id=claimed.lease.lease_id,
+                    claimed_version=claimed.lease.claimed_version,
+                )
+                if trusted.error_code is not None:
+                    report = await self._advance(
+                        task, stage, claimed_running=True,
+                        precomputed_result=StageExecutionResult.failed(
+                            stage.stage_id, error_code=trusted.error_code,
+                            execution_kind=StageExecutionKind.TOOL,
+                            selected_tool_id=stage.tool_id,
+                        ),
+                        output_store=persisted_output_store,
+                    )
+                    completed = next(
+                        item for item in report.state.stage_states
+                        if item.stage_id == stage.stage_id
+                    )
+                else:
+                    result_digest = trusted.result_content_digest
+            repository.record_stage_execution_outcome(
+                claimed, execution_authority, prepared,
+                prepared.execution_authority, report.state,
+                invocation_receipt=(
+                    receipt if stage.execution_kind is StageExecutionKind.TOOL
+                    else model_receipt
+                ),
+                result_content_digest=result_digest,
+            )
         saved = repository.complete_claim(
             task.task_id, stage.stage_id, claimed.lease.lease_id,
             execution_authority, report.state,
@@ -660,9 +1355,12 @@ class StageExecutionCoordinator:
         granted_permissions: frozenset[ToolPermission] | None = None,
         environment: DeploymentEnvironment | None = None,
         claimed_running: bool = False,
+        precomputed_result: StageExecutionResult | None = None,
+        output_store: StageOutputStore | None = None,
     ) -> StageCoordinationReport:
         if type(task) is not AgentTaskState or type(stage) is not TaskStage:
             raise InvalidStageCoordinationError("Task or stage is invalid")
+        active_output_store = self._output_store if output_store is None else output_store
         resuming = approved_request is not None
         if claimed_running and resuming:
             raise InvalidStageCoordinationError("Persisted approval resume is unsupported")
@@ -712,7 +1410,7 @@ class StageExecutionCoordinator:
             ):
                 raise StageOutputNotFoundError("Previous stage output is unavailable")
             try:
-                previous_output = self._output_store.get(
+                previous_output = active_output_store.get(
                     StageOutputReference(previous_stage.output_reference),
                     task_id=task.task_id, stage_id=previous_stage.stage_id,
                 )
@@ -760,7 +1458,9 @@ class StageExecutionCoordinator:
         )
 
         try:
-            if stage.execution_kind is StageExecutionKind.TOOL:
+            if precomputed_result is not None:
+                result = precomputed_result
+            elif stage.execution_kind is StageExecutionKind.TOOL:
                 if self._tool_executor is None:
                     result = StageExecutionResult.failed(
                         stage.stage_id, error_code="tool_unavailable",
@@ -831,7 +1531,7 @@ class StageExecutionCoordinator:
                     content_type="text/plain", text_content=result.text_content,
                     created_at=terminal_at,
                 )
-                reference = self._output_store.put(output)
+                reference = active_output_store.put(output)
                 if type(reference) is not StageOutputReference:
                     raise InvalidStageExecutionResultError("Stage output reference is invalid")
                 reference.__post_init__()

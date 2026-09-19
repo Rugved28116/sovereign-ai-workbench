@@ -91,7 +91,14 @@ def awaiting_task():
 
 
 def repository(tmp_path):
-    return SQLiteTaskStateRepository(tmp_path / "tasks.sqlite", clock=lambda: at(10))
+    return SQLiteTaskStateRepository._for_test(tmp_path / "tasks.sqlite", clock=lambda: at(10))
+
+
+def test_production_repository_constructor_does_not_accept_a_clock(tmp_path):
+    with pytest.raises(TypeError):
+        SQLiteTaskStateRepository(
+            tmp_path / "tasks.sqlite", clock=lambda: at(10),
+        )
 
 
 @pytest.mark.parametrize("bad", [None, "", "tasks.sqlite", "/bad\x00path", object()])
@@ -231,9 +238,9 @@ def test_round_trip_completed_tool_with_artifact_reference():
 
 def test_repository_survives_reopen(tmp_path):
     path = tmp_path / "tasks.sqlite"
-    with SQLiteTaskStateRepository(path, clock=lambda: at(10)) as repo:
+    with SQLiteTaskStateRepository._for_test(path, clock=lambda: at(10)) as repo:
         saved = repo.create(model_task())
-    with SQLiteTaskStateRepository(path, clock=lambda: at(11)) as reopened:
+    with SQLiteTaskStateRepository._for_test(path, clock=lambda: at(11)) as reopened:
         assert reopened.get("task-1") == saved
     with pytest.raises(TaskPersistenceError):
         reopened.get("task-1")

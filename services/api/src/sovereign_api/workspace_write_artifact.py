@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import errno
+import hashlib
+import hmac
 import os
 import secrets
 import stat
@@ -336,6 +338,48 @@ def _write_bytes(parent_fd: int, name: str, content: bytes) -> None:
             if _unsupported(close_error):
                 raise ArtifactSafeOpenUnsupportedError("Safe artifact writing is unavailable") from None
             raise ArtifactFileAccessError("Artifact descriptor could not be closed") from None
+
+
+def verify_artifact_content(
+    artifact_root: Path | str, reference: object, expected_digest: object,
+) -> bool:
+    """Verify one artifact through the same descriptor-relative trust boundary."""
+
+    if (
+        type(expected_digest) is not str or len(expected_digest) != 64
+        or any(character not in "0123456789abcdef" for character in expected_digest)
+    ):
+        return False
+    try:
+        root = _root(artifact_root)
+        parts = _parts(reference)
+        parent_fd, descriptors = _opened_parent(root, parts)
+        file_fd: int | None = None
+        try:
+            expected = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISREG(expected.st_mode):
+                return False
+            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            file_fd = os.open(parts[-1], flags, dir_fd=parent_fd)
+            opened = os.fstat(file_fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+            ):
+                return False
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(file_fd, 65_536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            return hmac.compare_digest(digest.hexdigest(), expected_digest)
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+            _close_all(descriptors)
+    except (ArtifactWriteError, OSError, ValueError):
+        return False
 
 
 @dataclass(frozen=True, slots=True)
